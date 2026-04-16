@@ -476,16 +476,17 @@ def run_mixed_anova(df, alpha, sph_corr):
     # Correct formula
     SS_B = 0
     for t in within_lv:
-        SS_B += (df[df["within"] == t]["dv"].mean() - grand_mean) ** 2
-    SS_B = SS_B * N
+        for g in between_lv:
+            n_g = n_per_between[g]
+            SS_B += n_g * (within_means[t] - grand_mean) ** 2
 
     # SS_AB (interaction)
     SS_AB = 0
     for g in between_lv:
         for t in within_lv:
             cell_m = df[(df["between"] == g) & (df["within"] == t)]["dv"].mean()
-            SS_AB += (cell_m - between_means[g] - within_means[t] + grand_mean) ** 2
-    SS_AB = SS_AB * (N / len(between_lv))
+            n_g = n_per_between[g]
+            SS_AB += n_g * (cell_m - between_means[g] - within_means[t] + grand_mean) ** 2
 
     # SS_error_within (B × S/A)
     SS_BxS_A = 0
@@ -493,15 +494,15 @@ def run_mixed_anova(df, alpha, sph_corr):
         row = df[df["subject"] == subj]
         g = row["between"].iloc[0]
         subj_mean = subj_means[subj]
+        subj_between_mean = between_means[g]
         for t in within_lv:
             val = row[row["within"] == t]["dv"].values
             if len(val) == 0:
                 continue
             v = val[0]
             cell_m = df[(df["between"] == g) & (df["within"] == t)]["dv"].mean()
-            # Rumus residual yang benar:
-            residual = v - cell_m - subj_mean + grand_mean
-            SS_BxS_A += residual ** 2
+            # residual = score - subject_mean - cell_mean + group_mean
+            SS_BxS_A += (v - subj_mean - cell_m + subj_between_mean) ** 2
 
     # ── Degrees of freedom ──────────────────────────────────────────────────
     df_A    = a - 1
@@ -556,14 +557,14 @@ def run_mixed_anova(df, alpha, sph_corr):
     # ── MS ──────────────────────────────────────────────────────────────────
     MS_A     = SS_A    / df_A
     MS_S_A   = SS_S_A  / df_S_A
-    MS_B     = SS_B    / df_B_adj if df_B_adj > 0 else 0
-    MS_AB    = SS_AB   / df_AB_adj if df_AB_adj > 0 else 0
-    MS_BxSA  = SS_BxS_A / df_BxSA_adj if df_BxSA_adj > 0 else 0
+    MS_B     = SS_B    / df_B_adj
+    MS_AB    = SS_AB   / df_AB_adj
+    MS_BxSA  = SS_BxS_A / df_BxSA_adj
 
     # ── F ratios ─────────────────────────────────────────────────────────────
     F_A   = MS_A   / MS_S_A
-    F_B   = MS_B   / MS_BxSA if MS_BxSA > 0 else np.nan
-    F_AB  = MS_AB  / MS_BxSA if MS_BxSA > 0 else np.nan
+    F_B   = MS_B   / MS_BxSA
+    F_AB  = MS_AB  / MS_BxSA
 
     p_A   = 1 - fdist.cdf(F_A,  df_A,    df_S_A)
     p_B   = 1 - fdist.cdf(F_B,  df_B_adj, df_BxSA_adj)
