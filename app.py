@@ -1285,7 +1285,7 @@ def build_word_report(res, df, between_col, within_col, dv_col, alpha_level,
     # ── Figure ─────────────────────────────────────────────────────────────
     doc.add_heading("6. Figures", level=1)
     img_buf = io.BytesIO()
-    fig.savefig(img_buf, format="png", dpi=150, bbox_inches="tight",
+    fig.savefig(img_buf, format="png", dpi=300, bbox_inches="tight",
                 facecolor="#fafafa")
     img_buf.seek(0)
     doc.add_picture(img_buf, width=Inches(6.0))
@@ -1357,7 +1357,7 @@ with dcol2:
 # 3. Figure PNG
 with dcol3:
     img_buf2 = io.BytesIO()
-    fig.savefig(img_buf2, format="png", dpi=200, bbox_inches="tight", facecolor="#fafafa")
+    fig.savefig(img_buf2, format="png", dpi=300, bbox_inches="tight", facecolor="#fafafa")
     img_buf2.seek(0)
     st.download_button("🖼️ Figures (PNG)", img_buf2.getvalue(),
                        "mixed_anova_figures.png", "image/png", use_container_width=True)
