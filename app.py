@@ -1,1389 +1,1353 @@
 """
-Mixed ANOVA Calculator — SPSS GLM Repeated Measures Equivalent
-==============================================================
-Input  : WIDE format CSV (one row per subject)
-Engine : Fully parametric path (Mixed ANOVA) when normality holds;
-         automatically switches to non-parametric alternatives when violated.
-
-Parametric path — SPSS-identical formulas (Winer, Brown & Michels 1991, Ch. 7):
-  SS_A     = b · Σᵢ nᵢ (Ȳᵢ.. − Ȳ...)²               df = a−1
-  SS_S(A)  = b · Σᵢ Σₛ (Ȳₛ.. − Ȳᵢ..)²               df = N−a    ← between error
-  SS_B     = N · Σⱼ (Ȳ.j. − Ȳ...)²                   df = b−1
-  SS_AB    = Σᵢ nᵢ · Σⱼ (Ȳᵢⱼ − Ȳᵢ.. − Ȳ.j. + Ȳ...)² df = (a−1)(b−1)
-  SS_BS(A) = Σᵢ Σₛ Σⱼ (yₛⱼ − Ȳₛ.. − Ȳᵢⱼ + Ȳᵢ..)²   df = (b−1)(N−a) ← within error
-  [Verified: five components sum exactly to SS_Total]
-
-  F_A  = MS_A  / MS_S(A)   F_B = MS_B / MS_BS(A)   F_AB = MS_AB / MS_BS(A)
-  Partial η²p = SS_effect / (SS_effect + SS_error_for_that_effect)
-  EMM SE = √(MS_BS(A) / n_cell) with t(df_BS(A)) CI  — SPSS method
-  Mauchly W via Box (1954) χ² approx; GG / HF (Lecoutre 1991) / LB corrections
-
-Non-parametric path (when any cell violates normality at α = .05):
-  Within-subjects : Friedman test per group; Wilcoxon signed-rank post-hoc
-  Between-subjects: Kruskal–Wallis; Mann–Whitney U post-hoc
-  Effect sizes    : Kendall's W (Friedman), rank-biserial r (Mann–Whitney)
+Mixed-Design ANOVA (Split-Plot ANOVA) Web Application
+SPSS-equivalent statistical analysis using pingouin
 """
 
-import io
-import itertools
-import re
-import warnings
-
-import numpy as np
-import pandas as pd
-import scipy.stats as stats
-from scipy.stats import f as fdist
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as mgs
-import seaborn as sns
-
 import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+from scipy import stats
+from scipy.stats import levene
+import pingouin as pg
+from itertools import combinations
+import warnings
+import io
+import csv
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
-from docx import Document
-from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
+# ─── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Mixed-Design ANOVA",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="Mixed ANOVA Calculator", page_icon="📊",
-                   layout="wide", initial_sidebar_state="expanded")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CSS
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
-html,body,[class*="css"]{font-family:'Inter',sans-serif;}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 
-.app-title{font-family:'Lora',serif;font-size:2.1rem;font-weight:600;
-  color:#0d1b2a;letter-spacing:-.01em;margin-bottom:2px;}
-.app-sub{font-size:.86rem;color:#546e7a;font-weight:300;margin-bottom:1.4rem;}
-.sec{font-family:'Lora',serif;font-size:1.1rem;font-weight:600;color:#0d1b2a;
-  border-left:4px solid #c62828;padding-left:10px;margin-top:1.7rem;margin-bottom:.7rem;}
-.sec-np{font-family:'Lora',serif;font-size:1.1rem;font-weight:600;color:#4a148c;
-  border-left:4px solid #7b1fa2;padding-left:10px;margin-top:1.7rem;margin-bottom:.7rem;}
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+}
 
-.mcard{background:#0d1b2a;border-radius:10px;padding:.9rem 1.1rem .85rem;margin-bottom:4px;}
-.mcard .lbl{font-size:.62rem;font-weight:600;color:#7fa8c9;text-transform:uppercase;letter-spacing:.10em;}
-.mcard .val{font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#eaf2ff;margin:3px 0 2px;}
-.mcard .sub{font-size:.72rem;color:#90b8d8;line-height:1.5;}
-.rcard{background:#112233;border-radius:10px;padding:.9rem 1.1rem .85rem;margin-bottom:4px;}
-.rcard .lbl{font-size:.62rem;font-weight:600;color:#7fa8c9;text-transform:uppercase;letter-spacing:.10em;}
-.rcard .val{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;color:#eaf2ff;margin:3px 0 2px;}
-.rcard .sub{font-size:.72rem;color:#90b8d8;line-height:1.5;}
-.npcard{background:#1a0533;border-radius:10px;padding:.9rem 1.1rem .85rem;margin-bottom:4px;}
-.npcard .lbl{font-size:.62rem;font-weight:600;color:#ce93d8;text-transform:uppercase;letter-spacing:.10em;}
-.npcard .val{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;color:#f3e5f5;margin:3px 0 2px;}
-.npcard .sub{font-size:.72rem;color:#ce93d8;line-height:1.5;}
+.stApp {
+    background: #0d1117;
+    color: #e6edf3;
+}
 
-.p-sig{display:inline-block;background:#1b7f45;color:#fff;font-size:.68rem;font-weight:700;padding:2px 8px;border-radius:20px;}
-.p-ns {display:inline-block;background:#b71c1c;color:#fff;font-size:.68rem;font-weight:700;padding:2px 8px;border-radius:20px;}
-.p-trend{display:inline-block;background:#e65100;color:#fff;font-size:.68rem;font-weight:700;padding:2px 8px;border-radius:20px;}
+.main-header {
+    background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 2rem;
+    position: relative;
+    overflow: hidden;
+}
 
-.ibox{background:#f0f6ff;border-left:4px solid #1565c0;border-radius:6px;
-  padding:.8rem 1rem;font-size:.875rem;line-height:1.72;color:#0d1b2a;margin-bottom:.5rem;}
-.ibox-np{background:#f9f0ff;border-left:4px solid #7b1fa2;border-radius:6px;
-  padding:.8rem 1rem;font-size:.875rem;line-height:1.72;color:#1a0030;margin-bottom:.5rem;}
-.abox-warn{background:#fff8e1;border-left:4px solid #f9a825;border-radius:6px;
-  padding:.7rem 1rem;font-size:.84rem;color:#5d4037;margin-bottom:.5rem;}
-.abox-ok  {background:#e8f5e9;border-left:4px solid #2e7d32;border-radius:6px;
-  padding:.7rem 1rem;font-size:.84rem;color:#1b5e20;margin-bottom:.5rem;}
-.abox-info{background:#e3f2fd;border-left:4px solid #1565c0;border-radius:6px;
-  padding:.7rem 1rem;font-size:.84rem;color:#0d47a1;margin-bottom:.5rem;}
-.route-p {background:#e8f5e9;border:2px solid #2e7d32;border-radius:10px;
-  padding:1rem 1.2rem;font-size:.92rem;color:#1b5e20;margin:.6rem 0 1rem;}
-.route-np{background:#f9f0ff;border:2px solid #7b1fa2;border-radius:10px;
-  padding:1rem 1.2rem;font-size:.92rem;color:#4a148c;margin:.6rem 0 1rem;}
-.upload-hint{background:#f5f7fa;border:1.5px dashed #b0bec5;border-radius:8px;
-  padding:.85rem 1rem;font-size:.84rem;color:#546e7a;}
+.main-header::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #2ea043, #58a6ff, #bc8cff);
+}
 
-[data-testid="stSidebar"]{background:#0d1b2a !important;}
-[data-testid="stSidebar"] *{color:#cfe2f3 !important;}
-[data-testid="stSidebar"] hr{border-color:#1c3048 !important;}
+.main-header h1 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: #e6edf3;
+    margin: 0 0 0.5rem 0;
+    letter-spacing: -0.5px;
+}
+
+.main-header p {
+    color: #8b949e;
+    font-size: 0.95rem;
+    margin: 0;
+}
+
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-family: 'IBM Plex Mono', monospace;
+    margin-right: 6px;
+}
+
+.badge-green { background: #1a3a2a; color: #3fb950; border: 1px solid #2ea043; }
+.badge-blue  { background: #0d2137; color: #58a6ff; border: 1px solid #1f6feb; }
+.badge-purple{ background: #1e1433; color: #bc8cff; border: 1px solid #8957e5; }
+
+.section-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.section-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #21262d;
+}
+
+.stat-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    font-family: 'IBM Plex Mono', monospace;
+}
+
+.stat-table th {
+    background: #21262d;
+    color: #58a6ff;
+    padding: 8px 12px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 2px solid #30363d;
+}
+
+.stat-table td {
+    padding: 7px 12px;
+    border-bottom: 1px solid #21262d;
+    color: #c9d1d9;
+}
+
+.stat-table tr:hover td { background: #1c2128; }
+
+.sig-yes { color: #3fb950; font-weight: 600; }
+.sig-no  { color: #f78166; }
+.sig-mar { color: #e3b341; }
+
+.interp-box {
+    background: #0d2137;
+    border: 1px solid #1f6feb;
+    border-left: 4px solid #58a6ff;
+    border-radius: 8px;
+    padding: 1.25rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+    line-height: 1.7;
+    color: #c9d1d9;
+}
+
+.warn-box {
+    background: #2d2000;
+    border: 1px solid #9e6a03;
+    border-left: 4px solid #e3b341;
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 0.75rem 0;
+    font-size: 0.875rem;
+    color: #e3b341;
+}
+
+.ok-box {
+    background: #0a1f12;
+    border: 1px solid #2ea043;
+    border-left: 4px solid #3fb950;
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 0.75rem 0;
+    font-size: 0.875rem;
+    color: #3fb950;
+}
+
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1rem;
+    margin: 1rem 0;
+}
+
+.metric-card {
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 1rem;
+    text-align: center;
+}
+
+.metric-val {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: #58a6ff;
+}
+
+.metric-label {
+    font-size: 0.78rem;
+    color: #8b949e;
+    margin-top: 4px;
+}
+
+/* Streamlit overrides */
+.stButton > button {
+    background: #21262d;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    border-radius: 6px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+.stButton > button:hover {
+    background: #30363d;
+    border-color: #58a6ff;
+    color: #58a6ff;
+}
+
+.stSelectbox > div > div, .stMultiSelect > div > div {
+    background: #161b22 !important;
+    border-color: #30363d !important;
+    color: #e6edf3 !important;
+}
+
+div[data-testid="stSidebar"] {
+    background: #0d1117;
+    border-right: 1px solid #21262d;
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    background: transparent;
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    border-radius: 6px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8rem;
+}
+.stTabs [aria-selected="true"] {
+    background: #1f6feb !important;
+    border-color: #58a6ff !important;
+    color: #e6edf3 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    st.markdown("---")
-    alpha_level = st.selectbox("Significance level (α)", [0.05,0.01,0.001,0.10], index=0)
-    norm_alpha  = st.selectbox("Normality decision α", [0.05,0.01,0.10], index=0,
-                               help="Shapiro–Wilk p-threshold for choosing parametric vs non-parametric path.")
-    posthoc_method = st.selectbox("Post-hoc correction",
-        ["bonferroni","holm","sidak","fdr_bh"],
-        format_func=lambda x:{"bonferroni":"Bonferroni","holm":"Holm (step-down)",
-                              "sidak":"Šidák","fdr_bh":"FDR Benjamini–Hochberg"}[x])
-    effect_pref = st.selectbox("Effect size metric",
-        ["partial_eta2","eta2","cohen_f"],
-        format_func=lambda x:{"partial_eta2":"Partial η²p (SPSS default)",
-                              "eta2":"η² (eta-squared)","cohen_f":"Cohen's f"}[x])
-    sph_corr = st.selectbox("Sphericity correction",
-        ["auto","gg","hf","lb","none"],
-        format_func=lambda x:{"auto":"Auto (GG when p<α)","gg":"Greenhouse–Geisser",
-                              "hf":"Huynh–Feldt","lb":"Lower-bound","none":"None"}[x])
-    st.markdown("---")
-    pal_name   = st.selectbox("Color palette",["tab10","Set2","deep","colorblind","husl"])
-    grid_style = st.selectbox("Grid style",["whitegrid","ticks","darkgrid"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HEADER
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="app-title">Mixed ANOVA Calculator</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="app-sub">SPSS GLM Repeated Measures Equivalent · Wide-Format Input · '
-    'Automatic Parametric / Non-Parametric Routing · '
-    'Mauchly Sphericity · GG/HF/LB Corrections · EMM · Full Report Export</div>',
-    unsafe_allow_html=True)
+# ════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FORMAT GUIDE & TEMPLATES
-# ══════════════════════════════════════════════════════════════════════════════
-with st.expander("📋  Data Format Guide & CSV Template Download", expanded=False):
-    st.markdown('<div class="sec">Required CSV Format — Wide (One Row Per Subject)</div>',
-                unsafe_allow_html=True)
-    c1,c2=st.columns([1,1])
-    with c1:
-        st.markdown(
-            "**Wide format:** one row per subject. Each repeated measurement "
-            "is a separate column. Column names for repeated measures become the "
-            "within-subjects level labels."
-        )
-        st.dataframe(pd.DataFrame({
-            "Column":  ["subject_id (optional)","group_col","time_1","time_2","… time_b"],
-            "Role":    ["Unique subject identifier (optional)",
-                        "Between-subjects factor (group membership)",
-                        "Score at time-point 1","Score at time-point 2",
-                        "Score at time-point b"],
-            "Example": ["1, 2, 3, …","Control / Treat_A / Treat_B",
-                        "42.5","51.3","…"],
-            "Required":["No","Yes","Yes","Yes","Yes"],
-        }), hide_index=True, use_container_width=True)
-    with c2:
-        st.dataframe(pd.DataFrame({
-            "Rule":[
-                "Min. between-subjects groups","Min. repeated measures (columns)",
-                "Max. groups / measures","Min. subjects per group",
-                "All measures required","Missing values","File size","Encoding"],
-            "Specification":[
-                "2 (supports 3, 4, … k)","2 (supports 3, 4, … b)",
-                "No hard limit","≥ 5 (≥ 10 recommended)",
-                "Every subject must have all time-point columns filled",
-                "Rows with any NA removed (listwise deletion)","3 MB","UTF-8"],
-        }), hide_index=True, use_container_width=True)
-        st.markdown("**Tip:** Name repeated-measure columns with a number prefix "
-                    "(e.g., `1_Pre`, `2_Post`) to control their order.")
+def sig_star(p):
+    if p < .001: return "***"
+    if p < .01:  return "**"
+    if p < .05:  return "*"
+    if p < .10:  return "†"
+    return "ns"
 
-    st.markdown("---")
-    def make_wide_template(groups, times, n_per, seed=0):
-        np.random.seed(seed)
-        base  = {g:50+i*3      for i,g in enumerate(groups)}
-        tgain = {t:j*4          for j,t in enumerate(times)}
-        igain = {g:{t:i*j*1.5  for j,t in enumerate(times)}
-                 for i,g in enumerate(groups)}
-        rows,sid=[],1
-        for g in groups:
-            for _ in range(n_per):
-                re=np.random.normal(0,3)
-                row={"Group":g}
-                for t in times:
-                    row[t]=round(base[g]+tgain[t]+igain[g][t]+re+np.random.normal(0,2),2)
-                rows.append(row); sid+=1
-        return pd.DataFrame(rows)
+def sig_color(p):
+    if p < .05:  return "sig-yes"
+    if p < .10:  return "sig-mar"
+    return "sig-no"
 
-    tpls={
-        "2 groups × 2 measures": make_wide_template(["Control","Treatment"],["Pre","Post"],12),
-        "2 groups × 3 measures": make_wide_template(["Control","Treatment"],["Pre","Post","Follow_up"],10),
-        "3 groups × 3 measures": make_wide_template(["Control","Treat_A","Treat_B"],["Pre","Post","Follow_up"],10),
-        "3 groups × 4 measures": make_wide_template(["Control","Treat_A","Treat_B"],
-                                                    ["Baseline","Week4","Week8","Week12"],10),
-    }
-    tc=st.columns(4)
-    for col,(lbl,tdf) in zip(tc,tpls.items()):
-        with col:
-            st.markdown(f"**{lbl}**"); st.caption(f"{len(tdf)} rows")
-            fname=lbl.replace(" ","_").replace("×","x")+".csv"
-            st.download_button("⬇️ Download",tdf.to_csv(index=False).encode(),
-                               fname,"text/csv",use_container_width=True)
-    st.markdown("**Preview — 3 groups × 3 measures (first 9 rows):**")
-    st.dataframe(tpls["3 groups × 3 measures"].head(9),hide_index=True,use_container_width=True)
+def fmt(x, dec=3):
+    if pd.isna(x): return "—"
+    if isinstance(x, (int, np.integer)): return str(x)
+    return f"{x:.{dec}f}"
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  UPLOAD
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">Upload Data File (Wide Format)</div>', unsafe_allow_html=True)
-uploaded=st.file_uploader("Upload CSV — max 3 MB, UTF-8, wide format (one row per subject)",type=["csv"])
-if uploaded is None:
-    st.markdown('<div class="upload-hint">📂 No file uploaded yet. Upload your CSV above or download a template.</div>',
-                unsafe_allow_html=True); st.stop()
-if uploaded.size>3*1024*1024:
-    st.error("❌ File exceeds 3 MB."); st.stop()
-try:
-    df_raw=pd.read_csv(uploaded)
-except Exception as e:
-    st.error(f"❌ Cannot read CSV: {e}"); st.stop()
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  COLUMN MAPPING (wide format)
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">Column Mapping</div>', unsafe_allow_html=True)
-st.markdown("Select the between-subjects (group) column and the repeated-measure (time) columns.")
-
-all_cols=df_raw.columns.tolist()
-num_cols=[c for c in all_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
-cat_cols=[c for c in all_cols if not pd.api.types.is_numeric_dtype(df_raw[c])]
-
-cm1,cm2=st.columns([1,2])
-with cm1:
-    grp_col=st.selectbox("👥 Between-subjects factor (group column)",
-                         all_cols, index=0 if cat_cols==[] else all_cols.index(cat_cols[0])
-                         if cat_cols else 0)
-with cm2:
-    # Default: all numeric columns as time columns
-    default_times=[c for c in num_cols if c!=grp_col]
-    time_cols=st.multiselect("🔁 Repeated-measure columns (time-points, in order)",
-                             options=[c for c in all_cols if c!=grp_col],
-                             default=default_times,
-                             help="Select in the correct temporal order.")
-
-if len(time_cols)<2:
-    st.error("Select at least 2 repeated-measure columns."); st.stop()
-
-run=st.button("▶  Run Analysis", type="primary", use_container_width=True)
-if not run:
-    with st.expander("Preview uploaded data (first 8 rows)",expanded=False):
-        st.dataframe(df_raw.head(8),hide_index=True,use_container_width=True)
-    st.stop()
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA PREPARATION
-# ══════════════════════════════════════════════════════════════════════════════
-needed=[grp_col]+time_cols
-df_wide=df_raw[needed].copy()
-# Convert time columns to numeric
-for c in time_cols:
-    df_wide[c]=pd.to_numeric(df_wide[c],errors="coerce")
-n_before=len(df_wide); df_wide.dropna(inplace=True)
-if len(df_wide)<n_before:
-    st.warning(f"⚠️ {n_before-len(df_wide)} row(s) with missing values removed.")
-
-df_wide[grp_col]=df_wide[grp_col].astype(str)
-df_wide=df_wide.reset_index(drop=True)
-df_wide.insert(0,"_subj_",range(1,len(df_wide)+1))
-
-groups_list=sorted(df_wide[grp_col].unique().tolist(),key=str)
-a=len(groups_list); b=len(time_cols); N=len(df_wide)
-n_g=df_wide.groupby(grp_col)["_subj_"].count()
-
-if a<2: st.error("Between-subjects factor must have ≥ 2 groups."); st.stop()
-if b<2: st.error("Select ≥ 2 repeated-measure columns."); st.stop()
-if N<6: st.error("At least 6 subjects required."); st.stop()
-if n_g.min()<3: st.error(f"Smallest group has {n_g.min()} subject(s); minimum = 3."); st.stop()
-
-# Long format (for some computations)
-df_long=df_wide.melt(id_vars=["_subj_",grp_col],
-                     value_vars=time_cols,
-                     var_name="_time_",value_name="_y_")
-df_long["_time_"]=pd.Categorical(df_long["_time_"],categories=time_cols,ordered=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UTILITY
-# ══════════════════════════════════════════════════════════════════════════════
 def fmt_p(p):
     if pd.isna(p): return "—"
-    if p<0.001:    return "< .001"
-    s=f"{p:.3f}"; return s[1:] if s.startswith("0") else s
+    if p < .001: return "< .001"
+    return f".{int(round(p*1000)):03d}"[:-1] if p < 1 else f"{p:.3f}"
 
-def fmt_f(v,dec=3): return "—" if pd.isna(v) else f"{v:.{dec}f}"
+def fmt_p_val(p):
+    """Format p-value like SPSS"""
+    if pd.isna(p): return "—"
+    if p < .001: return "< .001"
+    return f"{p:.3f}"
 
-def cohen_f_es(np2):
-    return np.nan if (np.isnan(np2) or np2>=1) else float(np.sqrt(np2/(1-np2)))
 
-def magnitude(v,metric="partial_eta2"):
-    if np.isnan(v): return "—"
-    if metric in ("partial_eta2","eta2"):
-        if v<.010: return "negligible"
-        if v<.060: return "small"
-        if v<.140: return "medium"
-        return "large"
-    if v<.10: return "negligible"
-    if v<.25: return "small"
-    if v<.40: return "medium"
-    return "large"
+# ════════════════════════════════════════════════════════════════════════════
+# SAMPLE DATA GENERATORS
+# ════════════════════════════════════════════════════════════════════════════
 
-def obs_power(F_val,df1,df2,alpha):
+def generate_sample_2x2():
+    np.random.seed(42)
+    n_per = 15
+    data = []
+    groups = ['Control', 'Treatment']
+    means = {'Control': [50, 52], 'Treatment': [50, 62]}
+    for g in groups:
+        for i in range(n_per):
+            pre  = np.random.normal(means[g][0], 8)
+            post = np.random.normal(means[g][1], 8)
+            data.append({'ID': f'{g[0]}{i+1:02d}', 'Group': g,
+                         'Pre': round(pre,2), 'Post': round(post,2)})
+    return pd.DataFrame(data)
+
+def generate_sample_3x3():
+    np.random.seed(99)
+    n_per = 12
+    data = []
+    groups  = ['Control','Low_Dose','High_Dose']
+    means   = {'Control':[40,42,41],'Low_Dose':[40,50,55],'High_Dose':[40,58,70]}
+    for g in groups:
+        for i in range(n_per):
+            vals = [np.random.normal(means[g][t], 9) for t in range(3)]
+            data.append({'ID': f'{g[0]}{i+1:02d}', 'Group': g,
+                         'Pre': round(vals[0],2),
+                         'Mid': round(vals[1],2),
+                         'Post': round(vals[2],2)})
+    return pd.DataFrame(data)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DESCRIPTIVE STATISTICS
+# ════════════════════════════════════════════════════════════════════════════
+
+def compute_descriptives(df_long, between_col, within_col, dv_col):
+    desc = df_long.groupby([between_col, within_col])[dv_col].agg(
+        N='count', Mean='mean', SD='std', SE=lambda x: x.std()/np.sqrt(len(x)),
+        Min='min', Max='max',
+        Median='median'
+    ).reset_index()
+    desc['95% CI Lower'] = desc['Mean'] - 1.96 * desc['SE']
+    desc['95% CI Upper'] = desc['Mean'] + 1.96 * desc['SE']
+    return desc
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NORMALITY TESTS
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_normality(df_long, between_col, within_col, dv_col):
+    results = []
+    groups  = df_long[between_col].unique()
+    times   = df_long[within_col].unique()
+    for g in groups:
+        for t in times:
+            sub = df_long[(df_long[between_col]==g)&(df_long[within_col]==t)][dv_col].dropna()
+            n   = len(sub)
+            # Choose test: SW for n<=50, KS for n>50 (SPSS convention)
+            if n < 3:
+                results.append({'Group':g,'Time':t,'N':n,'Test':'N/A',
+                                 'Statistic':np.nan,'p-value':np.nan,'Normal':None,'Recommendation':''})
+                continue
+            if n <= 50:
+                stat, p = stats.shapiro(sub)
+                test_nm = 'Shapiro-Wilk'
+                rec = 'SW preferred (n ≤ 50)'
+            else:
+                stat, p = stats.kstest(sub, 'norm', args=(sub.mean(), sub.std()))
+                test_nm = 'Kolmogorov-Smirnov'
+                rec = 'KS preferred (n > 50)'
+            results.append({'Group':g,'Time':t,'N':n,'Test':test_nm,
+                             'Statistic':stat,'p-value':p,
+                             'Normal': p > .05,'Recommendation':rec})
+    return pd.DataFrame(results)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# LEVENE'S TEST
+# ════════════════════════════════════════════════════════════════════════════
+
+def test_levene(df_long, between_col, within_col, dv_col):
+    results = []
+    for t in df_long[within_col].unique():
+        groups_data = [
+            df_long[(df_long[between_col]==g)&(df_long[within_col]==t)][dv_col].dropna().values
+            for g in df_long[between_col].unique()
+        ]
+        if all(len(g) > 1 for g in groups_data):
+            stat, p = levene(*groups_data, center='mean')
+            results.append({'Time Point': t, 'Levene F': stat, 'p-value': p,
+                             'Equal Variances': p > .05})
+    return pd.DataFrame(results)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MIXED ANOVA
+# ════════════════════════════════════════════════════════════════════════════
+
+def run_mixed_anova(df_long, subject_col, between_col, within_col, dv_col):
+    aov = pg.mixed_anova(dv=dv_col, within=within_col,
+                          between=between_col, subject=subject_col,
+                          data=df_long, correction=True)
+    return aov
+
+def run_mauchly(df_long, subject_col, within_col, dv_col):
     try:
-        ncp=max(float(F_val*df1),0); crit=fdist.ppf(1-alpha,df1,df2)
-        return float(np.clip(1-stats.ncf.cdf(crit,df1,df2,nc=ncp),0,1))
-    except: return np.nan
+        sph = pg.sphericity(data=df_long, dv=dv_col,
+                            within=within_col, subject=subject_col)
+        return sph
+    except Exception:
+        return None
 
-def pill(p,alpha):
-    if pd.isna(p): return ""
-    lbl="< .001" if p<.001 else f"= {fmt_p(p)}"
-    if p<alpha:  return f'<span class="p-sig">p {lbl}  ✓</span>'
-    if p<0.10:   return f'<span class="p-trend">p {lbl}  ~</span>'
-    return f'<span class="p-ns">p {lbl}  n.s.</span>'
 
-def mcp(p_values,method,alpha):
-    """Multiple-comparison correction (no statsmodels required)."""
-    p=np.array(p_values,dtype=float); n=len(p); ord=np.argsort(p); adj=np.empty(n)
-    if method=="bonferroni":
-        adj=np.clip(p*n,0,1)
-    elif method=="holm":
-        for rk,ix in enumerate(ord): adj[ix]=min(1.0,p[ix]*(n-rk))
-        cm2=0.0
-        for ix in ord: cm2=max(cm2,adj[ix]); adj[ix]=cm2
-    elif method=="sidak":
-        adj=np.clip(1-(1-p)**n,0,1)
-    elif method=="fdr_bh":
-        ps=np.empty(n)
-        for i,ix in enumerate(ord): ps[i]=p[ix]*n/(i+1)
-        mn=1.0
-        for i in range(n-1,-1,-1): mn=min(mn,ps[i]); ps[i]=mn
-        for i,ix in enumerate(ord): adj[ix]=np.clip(ps[i],0,1)
-    else:
-        adj=np.clip(p*n,0,1)
-    return adj<alpha, adj
+# ════════════════════════════════════════════════════════════════════════════
+# POST-HOC TESTS
+# ════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STEP 1 — NORMALITY CHECK (Shapiro–Wilk per cell)
-# ══════════════════════════════════════════════════════════════════════════════
-sw_rows=[]
-any_nonnormal=False
-for g in groups_list:
-    for t in time_cols:
-        vals=df_wide[df_wide[grp_col]==g][t].values
-        if len(vals)<3: continue
-        W_sw,p_sw=stats.shapiro(vals)
-        nn=p_sw<norm_alpha
-        if nn: any_nonnormal=True
-        sw_rows.append({grp_col:g,"Time":t,"n":len(vals),
-                        "Shapiro–Wilk W":round(W_sw,4),
-                        "p-value":fmt_p(p_sw),
-                        "Normal":("Yes" if not nn else "No"),
-                        "_p_raw":p_sw})
-sw_df=pd.DataFrame(sw_rows)
+def run_posthoc(df_long, between_col, within_col, dv_col, subject_col, method='bonf'):
+    results = []
+    times  = sorted(df_long[within_col].unique())
+    groups = sorted(df_long[between_col].unique())
 
-PARAMETRIC = not any_nonnormal   # True → parametric path
+    # Between-group comparisons at each time point
+    for t in times:
+        sub = df_long[df_long[within_col]==t]
+        if len(groups) > 1:
+            ph = pg.pairwise_tests(data=sub, dv=dv_col,
+                                    between=between_col,
+                                    padjust=method)
+            for _, row in ph.iterrows():
+                results.append({
+                    'Comparison Type': 'Between-Groups',
+                    'Time Point': t,
+                    'Group A': row['A'], 'Group B': row['B'],
+                    'Mean Diff': row['mean(A)'] - row['mean(B)'],
+                    'SE': row.get('se', np.nan),
+                    't': row['T'], 'df': row['dof'],
+                    'p (adj)': row['p-corr'] if 'p-corr' in row else row.get('p-unc', np.nan),
+                    'p (unadj)': row.get('p-unc', np.nan),
+                    'Cohen d': row.get('cohen-d', np.nan),
+                    'Sig': sig_star(row['p-corr'] if 'p-corr' in row else row.get('p-unc', np.nan))
+                })
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STEP 2 — LEVENE'S TEST (homogeneity, relevant for parametric)
-# ══════════════════════════════════════════════════════════════════════════════
-lev_rows=[]
-for t in time_cols:
-    gdata=[df_wide[df_wide[grp_col]==g][t].values for g in groups_list]
-    if all(len(x)>=2 for x in gdata):
-        Fl,pl=stats.levene(*gdata,center="mean")
-        lev_rows.append({"Time":t,"Levene F":round(Fl,4),
-                         "df1":a-1,"df2":N-a,
-                         "p-value":fmt_p(pl),
-                         "Homogeneous":("Yes" if pl>alpha_level else "No"),
-                         "_p_raw":pl})
-lev_df=pd.DataFrame(lev_rows)
+    # Within-subject (time) comparisons per group
+    for g in groups:
+        sub = df_long[df_long[between_col]==g]
+        if len(times) > 1:
+            ph = pg.pairwise_tests(data=sub, dv=dv_col,
+                                    within=within_col, subject=subject_col,
+                                    padjust=method)
+            for _, row in ph.iterrows():
+                results.append({
+                    'Comparison Type': 'Within-Time',
+                    'Group': g,
+                    'Time A': row['A'], 'Time B': row['B'],
+                    'Mean Diff': row['mean(A)'] - row['mean(B)'],
+                    'SE': row.get('se', np.nan),
+                    't': row['T'], 'df': row['dof'],
+                    'p (adj)': row['p-corr'] if 'p-corr' in row else row.get('p-unc', np.nan),
+                    'p (unadj)': row.get('p-unc', np.nan),
+                    'Cohen d': row.get('cohen-d', np.nan),
+                    'Sig': sig_star(row['p-corr'] if 'p-corr' in row else row.get('p-unc', np.nan))
+                })
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAUCHLY'S TEST OF SPHERICITY
-# ══════════════════════════════════════════════════════════════════════════════
-def mauchly_test(wide_mat):
-    """wide_mat: (N, b) — all subjects × repeated measures."""
-    n,k=wide_mat.shape; p_c=k-1
-    C=np.zeros((k,p_c))
-    for j in range(p_c):
-        C[:j+1,j]=1/np.sqrt((j+1)*(j+2)); C[j+1,j]=-np.sqrt((j+1)/(j+2))
-    Y=wide_mat@C; S=np.cov(Y.T,ddof=1)
-    if S.ndim==0: S=np.array([[float(S)]])
-    det_S=max(np.linalg.det(S),1e-300); tr_S=np.trace(S)
-    W=float(np.clip(det_S/(tr_S/p_c)**p_c,1e-10,1.0))
-    ff=1-(2*p_c**2+p_c+2)/(6*p_c*(n-1))
-    dfm=int(p_c*(p_c+1)/2-1)
-    chi2=-np.log(W)*(n-1)*ff; pm=float(1-stats.chi2.cdf(chi2,dfm))
-    tr2=np.trace(S@S)
-    gg=float(np.clip(tr_S**2/(p_c*tr2),1/p_c,1.0))
-    hf_n=n*p_c*gg-2; hf_d=p_c*(n-1-p_c*gg)
-    hf=float(np.clip(hf_n/hf_d if hf_d else 1.0,1/p_c,1.0))
-    return dict(W=W,chi2=chi2,df_m=dfm,p=pm,eps_gg=gg,
-                eps_hf=hf,eps_lb=float(1/p_c))
+    return pd.DataFrame(results) if results else pd.DataFrame()
 
-wide_mat=df_wide[time_cols].values.astype(float)
-sph=None; eps=1.0; sph_label="None"
-if b>2 and PARAMETRIC:
-    sph=mauchly_test(wide_mat)
-    if sph_corr=="auto":
-        if sph["p"]<alpha_level: eps=sph["eps_gg"]; sph_label="Greenhouse–Geisser"
-        else: sph_label="None (sphericity satisfied)"
-    elif sph_corr=="gg":  eps=sph["eps_gg"]; sph_label="Greenhouse–Geisser"
-    elif sph_corr=="hf":  eps=sph["eps_hf"]; sph_label="Huynh–Feldt"
-    elif sph_corr=="lb":  eps=sph["eps_lb"]; sph_label="Lower-bound"
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PARAMETRIC PATH — MIXED ANOVA ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-def run_mixed_anova(df_wide, df_long, grp_col, time_cols, groups_list, a, b, N, eps, alpha):
-    """
-    SPSS GLM Repeated Measures — exact formula replication.
-    Uses wide-format input; internally converts for SS computation.
-    Verified: SS_A + SS_SA + SS_B + SS_AB + SS_BSA = SS_Total (to numerical precision).
-    """
-    n_g  = df_wide.groupby(grp_col)["_subj_"].count()
-    grand= df_long["_y_"].mean()
-    gm   = df_long.groupby(grp_col)["_y_"].mean()     # Ȳᵢ..
-    tm   = df_long.groupby("_time_")["_y_"].mean()    # Ȳ.j.
-    sm   = df_long.groupby("_subj_")["_y_"].mean()    # Ȳₛ..
-    sg   = df_long.groupby("_subj_")[grp_col].first()
+# ════════════════════════════════════════════════════════════════════════════
+# INTERACTION PLOT
+# ════════════════════════════════════════════════════════════════════════════
 
-    # Cell means Ȳᵢⱼ
-    cm={}
-    for g in groups_list:
-        for t in time_cols:
-            cm[(g,t)]=df_long[(df_long[grp_col]==g)&(df_long["_time_"]==t)]["_y_"].mean()
+def make_interaction_plot(desc, between_col, within_col, title='Profile Plot'):
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.patch.set_facecolor('#0d1117')
 
-    # ── SS (verified formula set) ────────────────────────────────────────────
-    SS_A  = b*sum(n_g[g]*(gm[g]-grand)**2 for g in groups_list)
-    SS_SA = sum(b*(sm[s]-gm[sg[s]])**2 for s in df_wide["_subj_"])
-    SS_B  = N*sum((tm[t]-grand)**2 for t in time_cols)
-    SS_AB = sum(n_g[g]*(cm[(g,t)]-gm[g]-tm[t]+grand)**2
-                for g in groups_list for t in time_cols)
-    SS_BSA=0.0
-    for _,r in df_long.iterrows():
-        SS_BSA+=(r["_y_"]-sm[r["_subj_"]]-cm[(r[grp_col],r["_time_"])]+gm[r[grp_col]])**2
-    SS_T=((df_long["_y_"]-grand)**2).sum()
+    palette = ['#58a6ff','#3fb950','#bc8cff','#e3b341','#f78166','#79c0ff']
+    groups  = desc[between_col].unique()
+    times   = desc[within_col].unique()
 
-    # ── df ───────────────────────────────────────────────────────────────────
-    df_A=a-1; df_SA=N-a; df_B=b-1; df_AB=(a-1)*(b-1); df_BSA=(b-1)*(N-a); df_Tot=N*b-1
+    for ax in axes:
+        ax.set_facecolor('#161b22')
+        ax.spines['bottom'].set_color('#30363d')
+        ax.spines['left'].set_color('#30363d')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(colors='#8b949e', labelsize=9)
+        ax.xaxis.label.set_color('#8b949e')
+        ax.yaxis.label.set_color('#8b949e')
+        ax.grid(axis='y', color='#21262d', alpha=0.8, linewidth=0.7)
 
-    # ── Corrected df (within effects) ────────────────────────────────────────
-    df_Bc=df_B*eps; df_ABc=df_AB*eps; df_BSAc=df_BSA*eps
+    # Left: Lines with error bars (±1 SE)
+    ax1 = axes[0]
+    for i, g in enumerate(groups):
+        sub = desc[desc[between_col]==g]
+        x   = range(len(sub))
+        ax1.errorbar(x, sub['Mean'], yerr=sub['SE'],
+                     marker='o', markersize=7, linewidth=2.5,
+                     color=palette[i % len(palette)],
+                     label=str(g), capsize=5, capthick=1.5,
+                     elinewidth=1.5, markeredgewidth=2,
+                     markeredgecolor='#0d1117')
+    ax1.set_xticks(range(len(times)))
+    ax1.set_xticklabels(times, fontsize=9)
+    ax1.set_xlabel('Time Point', fontsize=10)
+    ax1.set_ylabel('Mean Score', fontsize=10)
+    ax1.set_title('Profile Plot (±1 SE)', color='#e6edf3', fontsize=11, pad=10)
+    ax1.legend(title=between_col, title_fontsize=8, fontsize=8,
+               facecolor='#21262d', edgecolor='#30363d', labelcolor='#c9d1d9')
 
-    # ── MS ───────────────────────────────────────────────────────────────────
-    MS_A  =SS_A /df_A   if df_A   >0 else np.nan
-    MS_SA =SS_SA/df_SA  if df_SA  >0 else np.nan
-    MS_B  =SS_B /df_Bc  if df_Bc  >0 else np.nan
-    MS_AB =SS_AB/df_ABc if df_ABc >0 else np.nan
-    MS_BSA=SS_BSA/df_BSAc if df_BSAc>0 else np.nan
+    # Right: Bar chart with CI
+    ax2   = axes[1]
+    width = 0.8 / len(groups)
+    x_pos = np.arange(len(times))
+    for i, g in enumerate(groups):
+        sub = desc[desc[between_col]==g].sort_values(within_col)
+        offs = (i - len(groups)/2 + .5) * width
+        bars = ax2.bar(x_pos + offs, sub['Mean'], width=width*0.9,
+                       color=palette[i % len(palette)], alpha=0.85,
+                       label=str(g), edgecolor='#0d1117', linewidth=0.5)
+        ax2.errorbar(x_pos + offs, sub['Mean'],
+                     yerr=1.96*sub['SE'], fmt='none',
+                     color='white', capsize=3, capthick=1, elinewidth=1, alpha=0.6)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(times, fontsize=9)
+    ax2.set_xlabel('Time Point', fontsize=10)
+    ax2.set_ylabel('Mean Score', fontsize=10)
+    ax2.set_title('Bar Chart (95% CI)', color='#e6edf3', fontsize=11, pad=10)
+    ax2.legend(title=between_col, title_fontsize=8, fontsize=8,
+               facecolor='#21262d', edgecolor='#30363d', labelcolor='#c9d1d9')
 
-    # ── F & p ────────────────────────────────────────────────────────────────
-    def _F(e,r): return e/r if (not np.isnan(r) and r>0) else np.nan
-    def _p(F,d1,d2): return float(1-fdist.cdf(F,d1,d2)) if not np.isnan(F) else np.nan
+    plt.suptitle(title, color='#e6edf3', fontsize=13, fontweight='600', y=1.02)
+    plt.tight_layout()
+    return fig
 
-    F_A=_F(MS_A,MS_SA);   p_A=_p(F_A,df_A,df_SA)
-    F_B=_F(MS_B,MS_BSA);  p_B=_p(F_B,df_Bc,df_BSAc)
-    F_AB=_F(MS_AB,MS_BSA);p_AB=_p(F_AB,df_ABc,df_BSAc)
 
-    # ── Effect sizes ─────────────────────────────────────────────────────────
-    def _np2(se,sr): return float(se/(se+sr)) if (se+sr)>0 else np.nan
-    np2_A=_np2(SS_A,SS_SA); eta2_A=SS_A/SS_T if SS_T>0 else np.nan
-    np2_B=_np2(SS_B,SS_BSA);eta2_B=SS_B/SS_T if SS_T>0 else np.nan
-    np2_AB=_np2(SS_AB,SS_BSA);eta2_AB=SS_AB/SS_T if SS_T>0 else np.nan
+# ════════════════════════════════════════════════════════════════════════════
+# INTERPRETATION ENGINE
+# ════════════════════════════════════════════════════════════════════════════
 
-    # ── Power ────────────────────────────────────────────────────────────────
-    pw_A=obs_power(F_A,df_A,df_SA,alpha)
-    pw_B=obs_power(F_B,df_Bc,df_BSAc,alpha)
-    pw_AB=obs_power(F_AB,df_ABc,df_BSAc,alpha)
+def generate_interpretation(aov, desc, between_col, within_col, n_total):
+    lines = []
+    aov_dict = {}
+    for _, row in aov.iterrows():
+        src = str(row.get('Source', row.get('source', ''))).strip()
+        aov_dict[src] = row
 
-    # ── Estimated Marginal Means (SPSS method) ───────────────────────────────
-    t_w=stats.t.ppf(1-alpha/2,df_BSAc) if df_BSAc>0 else np.nan
-    t_b=stats.t.ppf(1-alpha/2,df_SA)   if df_SA>0   else np.nan
+    # Identify source names flexibly
+    src_names = list(aov_dict.keys())
+    between_src = next((s for s in src_names if between_col.lower() in s.lower()), src_names[0] if src_names else None)
+    within_src  = next((s for s in src_names if 'time' in s.lower() and 'inter' not in s.lower()), next((s for s in src_names if within_col.lower() in s.lower() or 'within' in s.lower()), None))
+    inter_src   = next((s for s in src_names if '*' in s or 'interaction' in s.lower() or 'inter' in s.lower()), None)
 
-    emm_rows=[]
-    for g in groups_list:
-        for t in time_cols:
-            n_c=int(n_g[g]); mn=cm[(g,t)]
-            se=float(np.sqrt(MS_BSA/n_c)) if (not np.isnan(MS_BSA) and MS_BSA>0) else np.nan
-            emm_rows.append({grp_col:g,"Time":t,"N":n_c,"Mean":round(mn,4),
-                             "SE (EMM)":round(se,4) if not np.isnan(se) else np.nan,
-                             f"CI Lower":round(mn-t_w*se,4) if not np.isnan(se) else np.nan,
-                             f"CI Upper":round(mn+t_w*se,4) if not np.isnan(se) else np.nan})
+    n_groups = desc[between_col].nunique()
+    n_times  = desc[within_col].nunique()
+    lines.append(f"**Study Design:** {n_groups}-group × {n_times}-time-point Mixed-Design ANOVA (N = {n_total})")
+    lines.append("")
 
-    emm_btw=[]
-    for g in groups_list:
-        n_i=int(n_g[g]); mn=float(gm[g])
-        se=float(np.sqrt(MS_SA/(b*n_i))) if (not np.isnan(MS_SA) and MS_SA>0) else np.nan
-        emm_btw.append({grp_col:g,"N":n_i,"Mean":round(mn,4),
-                        "SE (EMM)":round(se,4) if not np.isnan(se) else np.nan,
-                        "CI Lower":round(mn-t_b*se,4) if not np.isnan(se) else np.nan,
-                        "CI Upper":round(mn+t_b*se,4) if not np.isnan(se) else np.nan})
+    def _row_info(src):
+        if src and src in aov_dict:
+            r = aov_dict[src]
+            p = r.get('p_unc', r.get('p-unc', r.get('p-GG-corr', np.nan)))
+            F = r.get('F', np.nan)
+            eta = r.get('np2', r.get('eta_sq', np.nan))
+            return F, p, eta
+        return np.nan, np.nan, np.nan
 
-    emm_win=[]
-    for t in time_cols:
-        mn=float(tm[t])
-        se=float(np.sqrt(MS_BSA/N)) if (not np.isnan(MS_BSA) and MS_BSA>0) else np.nan
-        emm_win.append({"Time":t,"N":N,"Mean":round(mn,4),
-                        "SE (EMM)":round(se,4) if not np.isnan(se) else np.nan,
-                        "CI Lower":round(mn-t_w*se,4) if not np.isnan(se) else np.nan,
-                        "CI Upper":round(mn+t_w*se,4) if not np.isnan(se) else np.nan})
+    # Between-subjects
+    F_b, p_b, eta_b = _row_info(between_src)
+    lines.append("**① Between-Subjects Effect (Group)**")
+    if not np.isnan(p_b):
+        sig = "statistically significant" if p_b < .05 else "not statistically significant"
+        mag = "large" if (eta_b or 0)>.14 else ("medium" if (eta_b or 0)>.06 else "small")
+        lines.append(f"The main effect of Group was {sig} "
+                     f"(F = {fmt(F_b,2)}, p = {fmt_p_val(p_b)}, η²ₚ = {fmt(eta_b,3)}). "
+                     f"This represents a {mag} effect size. "
+                     + ("Groups differed significantly on the outcome, independent of time." if p_b < .05
+                        else "No significant overall difference was found between groups."))
+    lines.append("")
 
-    # ── Simple effects (SPSS F-test method) ──────────────────────────────────
-    se_rows=[]
-    # Within at each group
-    for g in groups_list:
-        n_i=int(n_g[g]); gm_i=float(gm[g])
-        SS_Bi=n_i*sum((cm[(g,t)]-gm_i)**2 for t in time_cols)
-        MS_Bi=SS_Bi/(b-1)
-        Fi=MS_Bi/MS_BSA if (not np.isnan(MS_BSA) and MS_BSA>0) else np.nan
-        pi=float(1-fdist.cdf(Fi,b-1,df_BSAc)) if not np.isnan(Fi) else np.nan
-        np2i=SS_Bi/(SS_Bi+MS_BSA*df_BSAc) if not np.isnan(MS_BSA) else np.nan
-        se_rows.append({"Effect":f"Within ({', '.join(time_cols)}) at {grp_col}={g}",
-                        "SS":round(SS_Bi,4),"df_num":b-1,"df_den":round(df_BSAc,3),
-                        "MS":round(MS_Bi,4),"F":round(Fi,4) if not np.isnan(Fi) else np.nan,
-                        "p":fmt_p(pi),"Partial η²p":round(np2i,4) if not np.isnan(np2i) else np.nan,
-                        "_p_raw":pi})
-    # Between at each time
-    for t in time_cols:
-        tm_t=df_long[df_long["_time_"]==t]["_y_"].mean()
-        SS_At=sum(n_g[g]*(cm[(g,t)]-tm_t)**2 for g in groups_list)
-        MS_At=SS_At/(a-1)
-        Ft=MS_At/MS_SA if (not np.isnan(MS_SA) and MS_SA>0) else np.nan
-        pt=float(1-fdist.cdf(Ft,a-1,df_SA)) if not np.isnan(Ft) else np.nan
-        np2t=SS_At/(SS_At+MS_SA*df_SA) if not np.isnan(MS_SA) else np.nan
-        se_rows.append({"Effect":f"Between ({grp_col}) at Time={t}",
-                        "SS":round(SS_At,4),"df_num":a-1,"df_den":df_SA,
-                        "MS":round(MS_At,4),"F":round(Ft,4) if not np.isnan(Ft) else np.nan,
-                        "p":fmt_p(pt),"Partial η²p":round(np2t,4) if not np.isnan(np2t) else np.nan,
-                        "_p_raw":pt})
+    # Within-subjects
+    F_w, p_w, eta_w = _row_info(within_src)
+    lines.append("**② Within-Subjects Effect (Time)**")
+    if not np.isnan(p_w):
+        sig = "statistically significant" if p_w < .05 else "not statistically significant"
+        mag = "large" if (eta_w or 0)>.14 else ("medium" if (eta_w or 0)>.06 else "small")
+        lines.append(f"The main effect of Time was {sig} "
+                     f"(F = {fmt(F_w,2)}, p = {fmt_p_val(p_w)}, η²ₚ = {fmt(eta_w,3)}). "
+                     f"This is a {mag} effect. "
+                     + ("Scores changed significantly across time points, collapsed across groups." if p_w < .05
+                        else "Scores did not change significantly over time when collapsed across groups."))
+    lines.append("")
 
-    return dict(
-        SS_A=SS_A,SS_SA=SS_SA,SS_B=SS_B,SS_AB=SS_AB,SS_BSA=SS_BSA,SS_T=SS_T,
-        df_A=df_A,df_SA=df_SA,df_B=df_B,df_AB=df_AB,df_BSA=df_BSA,df_Tot=df_Tot,
-        df_Bc=df_Bc,df_ABc=df_ABc,df_BSAc=df_BSAc,
-        MS_A=MS_A,MS_SA=MS_SA,MS_B=MS_B,MS_AB=MS_AB,MS_BSA=MS_BSA,
-        F_A=F_A,F_B=F_B,F_AB=F_AB,p_A=p_A,p_B=p_B,p_AB=p_AB,
-        np2_A=np2_A,np2_B=np2_B,np2_AB=np2_AB,
-        eta2_A=eta2_A,eta2_B=eta2_B,eta2_AB=eta2_AB,
-        pw_A=pw_A,pw_B=pw_B,pw_AB=pw_AB,
-        grand=grand,gm=gm,tm=tm,cm=cm,n_g=n_g,
-        emm_df=pd.DataFrame(emm_rows),
-        emm_btw=pd.DataFrame(emm_btw),
-        emm_win=pd.DataFrame(emm_win),
-        se_df=pd.DataFrame(se_rows),
-        t_w=t_w,t_b=t_b,
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PARAMETRIC POST-HOC
-# ══════════════════════════════════════════════════════════════════════════════
-def ph_between_param(df_wide, grp_col, groups_list, method, alpha):
-    """Pooled-variance t-tests (equal_var=True) — SPSS GLM post-hoc default."""
-    rows=[]
-    for l1,l2 in itertools.combinations(groups_list,2):
-        g1=df_wide[df_wide[grp_col]==l1][time_cols].values.flatten()
-        g2=df_wide[df_wide[grp_col]==l2][time_cols].values.flatten()
-        # Use group means (one value per subject) for the between comparison
-        m1=df_wide[df_wide[grp_col]==l1][time_cols].mean(axis=1).values
-        m2=df_wide[df_wide[grp_col]==l2][time_cols].mean(axis=1).values
-        t_,pr=stats.ttest_ind(m1,m2,equal_var=True)
-        md=m1.mean()-m2.mean()
-        n1,n2=len(m1),len(m2)
-        sp=np.sqrt(((n1-1)*m1.std(ddof=1)**2+(n2-1)*m2.std(ddof=1)**2)/(n1+n2-2))
-        rows.append({f"{grp_col} 1":str(l1),f"{grp_col} 2":str(l2),
-                     "n₁":n1,"n₂":n2,
-                     "Mean₁":round(m1.mean(),4),"Mean₂":round(m2.mean(),4),
-                     "Diff":round(md,4),"t":round(t_,4),"df":n1+n2-2,
-                     "p_raw":pr,"Cohen's d":round(md/sp,4) if sp>0 else np.nan})
-    if not rows: return pd.DataFrame()
-    ph=pd.DataFrame(rows)
-    _,adj=mcp(ph["p_raw"].tolist(),method,alpha)
-    ph["p (corrected)"]=[ fmt_p(x) for x in adj]
-    ph["Reject H₀"]=[x<alpha for x in adj]
-    ph["p (uncorrected)"]=ph["p_raw"].map(fmt_p); ph.drop(columns=["p_raw"],inplace=True)
-    return ph
-
-def ph_within_param(df_wide, time_cols, method, alpha):
-    """Paired t-tests + correction — SPSS repeated measures post-hoc."""
-    rows=[]
-    for t1,t2 in itertools.combinations(time_cols,2):
-        d=df_wide[t1]-df_wide[t2]
-        t_,pr=stats.ttest_rel(df_wide[t1],df_wide[t2])
-        sd_d=d.std(ddof=1)
-        rows.append({"Level 1":t1,"Level 2":t2,"n":len(df_wide),
-                     "Mean₁":round(df_wide[t1].mean(),4),"Mean₂":round(df_wide[t2].mean(),4),
-                     "Diff":round(d.mean(),4),"SD(Diff)":round(sd_d,4),
-                     "t":round(t_,4),"df":len(df_wide)-1,
-                     "p_raw":pr,"Cohen's d":round(d.mean()/sd_d,4) if sd_d>0 else np.nan})
-    if not rows: return pd.DataFrame()
-    ph=pd.DataFrame(rows)
-    _,adj=mcp(ph["p_raw"].tolist(),method,alpha)
-    ph["p (corrected)"]=[fmt_p(x) for x in adj]
-    ph["Reject H₀"]=[x<alpha for x in adj]
-    ph["p (uncorrected)"]=ph["p_raw"].map(fmt_p); ph.drop(columns=["p_raw"],inplace=True)
-    return ph
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  NON-PARAMETRIC PATH
-# ══════════════════════════════════════════════════════════════════════════════
-def run_nonparametric(df_wide, grp_col, time_cols, groups_list, a, b, N, method, alpha):
-    """
-    Non-parametric mixed design analysis:
-    • Friedman test (within-subjects) — one per group + omnibus across all subjects
-    • Kruskal–Wallis (between-subjects) — at each time-point + omnibus
-    • Wilcoxon signed-rank post-hoc (within)
-    • Mann–Whitney U post-hoc (between)
-    • Kendall's W effect size (Friedman), rank-biserial r (Mann–Whitney)
-    """
-    results={}
-
-    # ── Friedman per group ────────────────────────────────────────────────────
-    fried_rows=[]
-    for g in groups_list:
-        sub=df_wide[df_wide[grp_col]==g][time_cols].values
-        if sub.shape[0]<3: continue
-        chi2,p=stats.friedmanchisquare(*sub.T)
-        # Kendall's W = chi2 / (n*(b-1))
-        W_k=chi2/(sub.shape[0]*(b-1)) if b>1 else np.nan
-        fried_rows.append({grp_col:g,"n":sub.shape[0],
-                           "Friedman χ²":round(chi2,4),"df":b-1,
-                           "p-value":fmt_p(p),"Kendall's W":round(W_k,4),
-                           "Significant":p<alpha,"_p":p})
-    fried_df=pd.DataFrame(fried_rows)
-
-    # ── Omnibus Friedman (all subjects) ───────────────────────────────────────
-    all_sub=df_wide[time_cols].values
-    chi2_all,p_all=stats.friedmanchisquare(*all_sub.T)
-    W_k_all=chi2_all/(N*(b-1)) if b>1 else np.nan
-
-    # ── Kruskal–Wallis at each time-point ─────────────────────────────────────
-    kw_rows=[]
-    for t in time_cols:
-        gdata=[df_wide[df_wide[grp_col]==g][t].values for g in groups_list]
-        H,p=stats.kruskal(*gdata)
-        # Eta-squared approximation: η²=(H-k+1)/(n-k)
-        eta2_kw=(H-(a-1))/(N-a) if N>a else np.nan
-        kw_rows.append({"Time":t,"Kruskal–Wallis H":round(H,4),"df":a-1,
-                        "p-value":fmt_p(p),"η² (approx)":round(eta2_kw,4),
-                        "Significant":p<alpha,"_p":p})
-    kw_df=pd.DataFrame(kw_rows)
-
-    # ── Omnibus KW (averaged across time) ─────────────────────────────────────
-    kw_data=[df_wide[df_wide[grp_col]==g][time_cols].values.flatten() for g in groups_list]
-    H_all,p_kw_all=stats.kruskal(*kw_data)
-
-    # ── Wilcoxon signed-rank post-hoc (within, per group) ─────────────────────
-    wilc_rows=[]
-    raw_ps_w=[]
-    for g in groups_list:
-        sub=df_wide[df_wide[grp_col]==g]
-        for t1,t2 in itertools.combinations(time_cols,2):
-            d=sub[t1].values-sub[t2].values
-            if len(d)<3: continue
-            stat,pr=stats.wilcoxon(d,alternative="two-sided")
-            # Rank-biserial r = 1 - 2*T_minus/(n*(n+1)/2) [simple approx via Z]
-            n_w=len(d)
-            Z=stats.norm.ppf(1-pr/2); rb=Z/np.sqrt(n_w)
-            raw_ps_w.append(pr)
-            wilc_rows.append({grp_col:g,"Level 1":t1,"Level 2":t2,"n":n_w,
-                              "Wilcoxon W":round(stat,4),"p_raw":pr,
-                              "r (rank-biserial)":round(rb,4)})
-    if wilc_rows:
-        wilc_df=pd.DataFrame(wilc_rows)
-        _,adj_w=mcp(wilc_df["p_raw"].tolist(),method,alpha)
-        wilc_df["p (corrected)"]=[fmt_p(x) for x in adj_w]
-        wilc_df["Reject H₀"]=[x<alpha for x in adj_w]
-        wilc_df["p (uncorrected)"]=wilc_df["p_raw"].map(fmt_p)
-        wilc_df.drop(columns=["p_raw"],inplace=True)
-    else:
-        wilc_df=pd.DataFrame()
-
-    # ── Mann–Whitney post-hoc (between, per time-point) ───────────────────────
-    mw_rows=[]
-    raw_ps_mw=[]
-    for t in time_cols:
-        for l1,l2 in itertools.combinations(groups_list,2):
-            g1=df_wide[df_wide[grp_col]==l1][t].values
-            g2=df_wide[df_wide[grp_col]==l2][t].values
-            U,pr=stats.mannwhitneyu(g1,g2,alternative="two-sided")
-            # Rank-biserial r = 1 - 2U/(n1*n2)
-            rb=1-2*U/(len(g1)*len(g2))
-            raw_ps_mw.append(pr)
-            mw_rows.append({"Time":t,f"{grp_col} 1":str(l1),f"{grp_col} 2":str(l2),
-                            "n₁":len(g1),"n₂":len(g2),
-                            "Median₁":round(np.median(g1),4),"Median₂":round(np.median(g2),4),
-                            "Mann–Whitney U":round(U,4),"p_raw":pr,
-                            "r (rank-biserial)":round(rb,4)})
-    if mw_rows:
-        mw_df=pd.DataFrame(mw_rows)
-        _,adj_mw=mcp(mw_df["p_raw"].tolist(),method,alpha)
-        mw_df["p (corrected)"]=[fmt_p(x) for x in adj_mw]
-        mw_df["Reject H₀"]=[x<alpha for x in adj_mw]
-        mw_df["p (uncorrected)"]=mw_df["p_raw"].map(fmt_p)
-        mw_df.drop(columns=["p_raw"],inplace=True)
-    else:
-        mw_df=pd.DataFrame()
-
-    # ── Descriptive: median per cell ───────────────────────────────────────────
-    desc_rows=[]
-    for g in groups_list:
-        for t in time_cols:
-            vals=df_wide[df_wide[grp_col]==g][t].values
-            desc_rows.append({grp_col:g,"Time":t,"n":len(vals),
-                              "Median":round(np.median(vals),4),
-                              "IQR":round(np.percentile(vals,75)-np.percentile(vals,25),4),
-                              "Min":round(vals.min(),4),"Max":round(vals.max(),4)})
-    desc_df=pd.DataFrame(desc_rows)
-
-    return dict(
-        fried_df=fried_df, chi2_all=chi2_all, p_all=p_all, W_k_all=W_k_all,
-        kw_df=kw_df, H_all=H_all, p_kw_all=p_kw_all,
-        wilc_df=wilc_df, mw_df=mw_df, desc_df=desc_df,
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  RUN ENGINES
-# ══════════════════════════════════════════════════════════════════════════════
-with st.spinner("⏳  Running analysis …"):
-    if PARAMETRIC:
-        res=run_mixed_anova(df_wide,df_long,grp_col,time_cols,
-                            groups_list,a,b,N,eps,alpha_level)
-        df_ph_b=ph_between_param(df_wide,grp_col,groups_list,posthoc_method,alpha_level)
-        df_ph_w=ph_within_param(df_wide,time_cols,posthoc_method,alpha_level)
-    else:
-        np_res=run_nonparametric(df_wide,grp_col,time_cols,
-                                 groups_list,a,b,N,posthoc_method,alpha_level)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ASSUMPTION RESULTS
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">Step 1 — Assumption Checks</div>', unsafe_allow_html=True)
-
-assump_tabs=st.tabs(["Normality — Shapiro–Wilk","Homogeneity of Variance — Levene",
-                     "Sphericity — Mauchly","Analysis Route"])
-with assump_tabs[0]:
-    st.markdown(
-        "Shapiro–Wilk test applied to **each cell** (group × time-point). "
-        "**p > α** is consistent with normality. "
-        "If **any** cell violates normality, the non-parametric path is selected automatically."
-    )
-    st.dataframe(sw_df.drop(columns=["_p_raw"]),hide_index=True,use_container_width=True)
-    if any_nonnormal:
-        st.markdown(
-            f'<div class="abox-warn"><b>Non-normality detected</b> — '
-            f'at least one cell has Shapiro–Wilk p &lt; {norm_alpha}. '
-            f'<b>Non-parametric analysis path selected automatically.</b></div>',
-            unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f'<div class="abox-ok"><b>Normality satisfied</b> — '
-            f'all cells have Shapiro–Wilk p ≥ {norm_alpha}. '
-            f'<b>Parametric Mixed ANOVA path selected.</b></div>',
-            unsafe_allow_html=True)
-
-with assump_tabs[1]:
-    st.markdown(
-        "Levene's test (center = mean) for equality of variances across groups "
-        "at each time-point. Relevant for the parametric path; informational for non-parametric."
-    )
-    st.dataframe(lev_df.drop(columns=["_p_raw"]),hide_index=True,use_container_width=True)
-
-with assump_tabs[2]:
-    if not PARAMETRIC:
-        st.markdown(
-            '<div class="abox-info">Mauchly\'s test is not applicable '
-            'on the non-parametric path.</div>', unsafe_allow_html=True)
-    elif b<=2:
-        st.markdown(
-            '<div class="abox-info">Mauchly\'s test not applicable — '
-            'within-subjects factor has only 2 levels (sphericity trivially satisfied).</div>',
-            unsafe_allow_html=True)
-    elif sph is None:
-        st.markdown('<div class="abox-info">Sphericity test not run.</div>',unsafe_allow_html=True)
-    else:
-        sph_tbl=pd.DataFrame({
-            "Statistic":["Mauchly's W","Chi-square (χ²)","df","p-value",
-                         "Greenhouse–Geisser ε","Huynh–Feldt ε","Lower-bound ε",
-                         "Correction applied","ε used"],
-            "Value":[f"{sph['W']:.4f}",f"{sph['chi2']:.4f}",str(sph['df_m']),
-                     fmt_p(sph['p']),f"{sph['eps_gg']:.4f}",f"{sph['eps_hf']:.4f}",
-                     f"{sph['eps_lb']:.4f}",sph_label,f"{eps:.4f}"],
-        })
-        st.dataframe(sph_tbl,hide_index=True,use_container_width=True)
-        if sph["p"]<alpha_level:
-            st.markdown(
-                f'<div class="abox-warn"><b>Sphericity violated</b> — '
-                f'W = {sph["W"]:.4f}, p {fmt_p(sph["p"])} &lt; {alpha_level}. '
-                f'df corrected using {sph_label} (ε = {eps:.4f}).</div>',
-                unsafe_allow_html=True)
+    # Interaction
+    F_i, p_i, eta_i = _row_info(inter_src)
+    lines.append("**③ Interaction Effect (Group × Time)**")
+    if not np.isnan(p_i):
+        mag = "large" if (eta_i or 0)>.14 else ("medium" if (eta_i or 0)>.06 else "small")
+        if p_i < .05:
+            lines.append(f"🔴 **SIGNIFICANT INTERACTION DETECTED** "
+                         f"(F = {fmt(F_i,2)}, p = {fmt_p_val(p_i)}, η²ₚ = {fmt(eta_i,3)}, effect = {mag}).")
+            lines.append("The effect of time differed significantly between groups — the groups followed "
+                         "different trajectories across time points. This is the key finding: "
+                         "**the main effects should be interpreted with caution** because the relationship "
+                         "between group and outcome changes across time. Conduct post-hoc pairwise comparisons "
+                         "to identify precisely where the groups diverged.")
+        elif p_i < .10:
+            lines.append(f"⚠️ **MARGINAL INTERACTION** "
+                         f"(F = {fmt(F_i,2)}, p = {fmt_p_val(p_i)}, η²ₚ = {fmt(eta_i,3)}).")
+            lines.append("A trend toward a Group × Time interaction is observed (p < .10). "
+                         "Interpret with caution and consider the practical significance.")
         else:
-            st.markdown(
-                f'<div class="abox-ok"><b>Sphericity satisfied</b> — '
-                f'W = {sph["W"]:.4f}, p {fmt_p(sph["p"])} ≥ {alpha_level}. '
-                f'No df correction required.</div>',
-                unsafe_allow_html=True)
+            lines.append(f"✅ **NO SIGNIFICANT INTERACTION** "
+                         f"(F = {fmt(F_i,2)}, p = {fmt_p_val(p_i)}, η²ₚ = {fmt(eta_i,3)}).")
+            lines.append("The groups followed similar patterns of change across time. "
+                         "The main effects can be interpreted independently.")
+    lines.append("")
+    lines.append("**Effect Size Benchmarks (Cohen, 1988):** Small: η²ₚ ≥ .01 · Medium: η²ₚ ≥ .06 · Large: η²ₚ ≥ .14")
+    return "\n\n".join(lines)
 
-with assump_tabs[3]:
-    if PARAMETRIC:
-        st.markdown(
-            '<div class="route-p">✅ <b>PARAMETRIC PATH SELECTED</b><br>'
-            'All cells satisfy the normality assumption (Shapiro–Wilk p ≥ α). '
-            'Proceeding with Mixed ANOVA (GLM Repeated Measures), '
-            'identical to SPSS output.</div>',
-            unsafe_allow_html=True)
-    else:
-        st.markdown(
-            '<div class="route-np">⚠️ <b>NON-PARAMETRIC PATH SELECTED</b><br>'
-            'One or more cells violate the normality assumption (Shapiro–Wilk p &lt; α). '
-            'Proceeding with non-parametric equivalents: '
-            '<b>Friedman test</b> (within-subjects) and '
-            '<b>Kruskal–Wallis test</b> (between-subjects), '
-            'with Wilcoxon signed-rank and Mann–Whitney U post-hoc comparisons.</div>',
-            unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ════════  PARAMETRIC OUTPUT  ════════
-# ══════════════════════════════════════════════════════════════════════════════
-if PARAMETRIC:
-    # ── Overview cards ─────────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Results Overview</div>', unsafe_allow_html=True)
-    oc=st.columns(5)
-    def mcard(col,lbl,val,sub):
-        col.markdown(f'<div class="mcard"><div class="lbl">{lbl}</div>'
-                     f'<div class="val">{val}</div><div class="sub">{sub}</div></div>',
-                     unsafe_allow_html=True)
-    mcard(oc[0],"Subjects (N)",str(N),f"{a} group(s) · {b} time-point(s)")
-    mcard(oc[1],f"Between — {grp_col}",f"F = {res['F_A']:.3f}",
-          f"p {fmt_p(res['p_A'])} · η²p = {res['np2_A']:.3f}")
-    mcard(oc[2],f"Within — Time",f"F = {res['F_B']:.3f}",
-          f"p {fmt_p(res['p_B'])} · η²p = {res['np2_B']:.3f}")
-    mcard(oc[3],"Interaction",f"F = {res['F_AB']:.3f}",
-          f"p {fmt_p(res['p_AB'])} · η²p = {res['np2_AB']:.3f}")
-    mcard(oc[4],"Grand Mean",f"{res['grand']:.3f}",
-          f"SD = {df_long['_y_'].std():.3f}")
+# ════════════════════════════════════════════════════════════════════════════
+# RENDER ANOVA TABLE (HTML)
+# ════════════════════════════════════════════════════════════════════════════
 
-    st.markdown("")
-    rc1,rc2,rc3=st.columns(3)
-    for col_,lbl,F,d1,d2,p,np2,eta2,pw in [
-        (rc1,grp_col,res["F_A"],res["df_A"],res["df_SA"],
-         res["p_A"],res["np2_A"],res["eta2_A"],res["pw_A"]),
-        (rc2,"Time (within)",res["F_B"],res["df_Bc"],res["df_BSAc"],
-         res["p_B"],res["np2_B"],res["eta2_B"],res["pw_B"]),
-        (rc3,f"{grp_col} × Time",res["F_AB"],res["df_ABc"],res["df_BSAc"],
-         res["p_AB"],res["np2_AB"],res["eta2_AB"],res["pw_AB"]),
-    ]:
-        cf=cohen_f_es(np2); mg=magnitude(np2,"partial_eta2")
-        col_.markdown(
-            f'<div class="rcard"><div class="lbl">{lbl}</div>'
-            f'<div class="val">F({d1:.2f}, {d2:.2f}) = {F:.3f}</div>'
-            f'<div class="sub">{pill(p,alpha_level)}</div>'
-            f'<div class="sub" style="margin-top:5px;">Partial η²p = {np2:.4f} ({mg})</div>'
-            f'<div class="sub">η² = {eta2:.4f} · Cohen\'s f = {fmt_f(cf)}</div>'
-            f'<div class="sub">Observed power = {pw:.3f}</div></div>',
-            unsafe_allow_html=True)
+def render_anova_table(aov):
+    rows = ""
+    for _, r in aov.iterrows():
+        src = str(r.get('Source', r.get('source', '')))
+        ss  = r.get('SS', np.nan)
+        df  = r.get('DF1', r.get('DF', r.get('ddof1', np.nan)))
+        ms  = r.get('MS', ss/df if (not np.isnan(ss) and not np.isnan(df) and df > 0) else np.nan)
+        F   = r.get('F', np.nan)
+        p   = r.get('p_unc', r.get('p-unc', r.get('p-GG-corr', np.nan)))
+        eta = r.get('np2', r.get('eta_sq', np.nan))
+        eps = r.get('eps', np.nan)
 
-    # ── Descriptives & EMM ─────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Descriptive Statistics & Estimated Marginal Means</div>',
-                unsafe_allow_html=True)
-    d1,d2,d3,d4=st.tabs(["Cell Raw Descriptives","Cell EMMs (SPSS)",
-                          f"Marginal EMMs — {grp_col}","Marginal EMMs — Time"])
-    with d1:
-        cr_rows=[]
-        for g in groups_list:
-            for t in time_cols:
-                v=df_wide[df_wide[grp_col]==g][t].values
-                cr_rows.append({grp_col:g,"Time":t,"N":len(v),
-                                "Mean":round(v.mean(),4),"SD":round(v.std(ddof=1),4),
-                                "SE":round(v.std(ddof=1)/np.sqrt(len(v)),4),
-                                "Min":round(v.min(),4),"Max":round(v.max(),4)})
-        st.dataframe(pd.DataFrame(cr_rows),hide_index=True,use_container_width=True)
-        st.caption("SE = SD / √n  (raw descriptive standard error).")
-    with d2:
-        ci_pct=int(100*(1-alpha_level))
-        st.markdown(
-            f"**SPSS Estimated Marginal Means.** "
-            f"SE = √(MS_BS(A) / n_cell) = √({res['MS_BSA']:.4f} / n). "
-            f"CI = Mean ± t({res['df_BSAc']:.2f})×SE at α = {alpha_level} "
-            f"(t-critical = ±{res['t_w']:.4f})."
-        )
-        emm=res["emm_df"].copy()
-        emm.columns=[grp_col,"Time","N","Mean","SE (EMM)",f"{ci_pct}% CI Lower",f"{ci_pct}% CI Upper"]
-        st.dataframe(emm,hide_index=True,use_container_width=True)
-    with d3:
-        eb=res["emm_btw"].copy()
-        ci_pct=int(100*(1-alpha_level))
-        eb.columns=[grp_col,"N","Mean","SE (EMM)",f"{ci_pct}% CI Lower",f"{ci_pct}% CI Upper"]
-        st.dataframe(eb,hide_index=True,use_container_width=True)
-    with d4:
-        ew=res["emm_win"].copy()
-        ew.rename(columns={"Time":"Time-point"},inplace=True)
-        st.dataframe(ew,hide_index=True,use_container_width=True)
+        cls = sig_color(p) if not np.isnan(p) else ''
+        star= sig_star(p)  if not np.isnan(p) else ''
+        rows += f"""
+        <tr>
+            <td><b>{src}</b></td>
+            <td>{fmt(ss,3)}</td>
+            <td>{fmt(df,0) if not np.isnan(df) else '—'}</td>
+            <td>{fmt(ms,3)}</td>
+            <td>{fmt(F,3)}</td>
+            <td class="{cls}">{fmt_p_val(p)} {star}</td>
+            <td>{fmt(eta,3)}</td>
+            <td>{fmt(eps,3) if not np.isnan(eps) else '—'}</td>
+        </tr>"""
 
-    # ── ANOVA Table ────────────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Mixed ANOVA Summary Table</div>', unsafe_allow_html=True)
-    at=[
-        {"Source":"BETWEEN SUBJECTS","SS":"","df":"","MS":"","F":"","p":"","Partial η²p":"","Obs. Power":""},
-        {"Source":f"  {grp_col}","SS":fmt_f(res["SS_A"]),"df":fmt_f(res["df_A"],0),
-         "MS":fmt_f(res["MS_A"]),"F":fmt_f(res["F_A"]),"p":fmt_p(res["p_A"]),
-         "Partial η²p":fmt_f(res["np2_A"]),"Obs. Power":fmt_f(res["pw_A"])},
-        {"Source":"  Error [S(A)]","SS":fmt_f(res["SS_SA"]),"df":fmt_f(res["df_SA"],0),
-         "MS":fmt_f(res["MS_SA"]),"F":"—","p":"—","Partial η²p":"—","Obs. Power":"—"},
-        {"Source":"WITHIN SUBJECTS","SS":"","df":"","MS":"","F":"","p":"","Partial η²p":"","Obs. Power":""},
-        {"Source":"  Time","SS":fmt_f(res["SS_B"]),"df":fmt_f(res["df_Bc"]),
-         "MS":fmt_f(res["MS_B"]),"F":fmt_f(res["F_B"]),"p":fmt_p(res["p_B"]),
-         "Partial η²p":fmt_f(res["np2_B"]),"Obs. Power":fmt_f(res["pw_B"])},
-        {"Source":f"  {grp_col} × Time","SS":fmt_f(res["SS_AB"]),"df":fmt_f(res["df_ABc"]),
-         "MS":fmt_f(res["MS_AB"]),"F":fmt_f(res["F_AB"]),"p":fmt_p(res["p_AB"]),
-         "Partial η²p":fmt_f(res["np2_AB"]),"Obs. Power":fmt_f(res["pw_AB"])},
-        {"Source":"  Error [BS(A)]","SS":fmt_f(res["SS_BSA"]),"df":fmt_f(res["df_BSAc"]),
-         "MS":fmt_f(res["MS_BSA"]),"F":"—","p":"—","Partial η²p":"—","Obs. Power":"—"},
-        {"Source":"Total","SS":fmt_f(res["SS_T"]),"df":fmt_f(res["df_Tot"],0),
-         "MS":"—","F":"—","p":"—","Partial η²p":"—","Obs. Power":"—"},
-    ]
-    at_df=pd.DataFrame(at)
-    st.dataframe(at_df,hide_index=True,use_container_width=True)
-    note="S(A) = Subjects within Groups (between error); BS(A) = B × Subjects within Groups (within error)."
-    if sph and eps<1.0:
-        note=f"Note: df for within-subjects effects adjusted using {sph_label} (ε = {eps:.4f}). "+note
-    st.caption(note)
+    html = f"""
+    <table class="stat-table">
+        <thead><tr>
+            <th>Source</th><th>SS</th><th>df</th><th>MS</th>
+            <th>F</th><th>p-value</th><th>η²ₚ</th><th>ε (GG)</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+    </table>
+    <p style="font-size:0.75rem;color:#8b949e;margin-top:6px;">
+    *** p &lt; .001 &nbsp;** p &lt; .01 &nbsp;* p &lt; .05 &nbsp;† p &lt; .10 &nbsp;ns p ≥ .10
+    </p>"""
+    return html
 
-    # ── Effect Sizes ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Effect Size Summary</div>', unsafe_allow_html=True)
-    st.dataframe(pd.DataFrame({
-        "Source":[grp_col,"Time (within)",f"{grp_col} × Time"],
-        "Partial η²p":[round(res["np2_A"],4),round(res["np2_B"],4),round(res["np2_AB"],4)],
-        "η² (total)":[round(res["eta2_A"],4),round(res["eta2_B"],4),round(res["eta2_AB"],4)],
-        "Cohen's f":[round(cohen_f_es(res["np2_A"]),4),round(cohen_f_es(res["np2_B"]),4),
-                     round(cohen_f_es(res["np2_AB"]),4)],
-        "Magnitude":[magnitude(res["np2_A"],"partial_eta2"),
-                     magnitude(res["np2_B"],"partial_eta2"),
-                     magnitude(res["np2_AB"],"partial_eta2")],
-        "F":[fmt_f(res["F_A"]),fmt_f(res["F_B"]),fmt_f(res["F_AB"])],
-        "p":[fmt_p(res["p_A"]),fmt_p(res["p_B"]),fmt_p(res["p_AB"])],
-        "Significant":[res["p_A"]<alpha_level,res["p_B"]<alpha_level,res["p_AB"]<alpha_level],
-    }),hide_index=True,use_container_width=True)
-    st.caption("Partial η²p benchmarks (Cohen 1988): negligible < .01; small .01–.05; medium .06–.13; large ≥ .14.")
 
-    # ── Post-hoc ───────────────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Post-Hoc Pairwise Comparisons</div>', unsafe_allow_html=True)
-    corr_lbl={"bonferroni":"Bonferroni","holm":"Holm","sidak":"Šidák",
-              "fdr_bh":"Benjamini–Hochberg FDR"}.get(posthoc_method,posthoc_method)
-    pt1,pt2,pt3=st.tabs([f"Between — {grp_col}","Within — Time",
-                         "Simple Effects (SPSS F-test)"])
-    with pt1:
-        st.markdown(f"Pooled-variance t-tests on subject means (SPSS GLM default). Correction: **{corr_lbl}**.")
-        if a<3:
-            st.markdown('<div class="abox-info">Only 2 groups — omnibus F-test is conclusive.</div>',
+# ════════════════════════════════════════════════════════════════════════════
+# PDF REPORT GENERATOR
+# ════════════════════════════════════════════════════════════════════════════
+
+def generate_pdf_report(desc, norm_df, lev_df, aov, interp_text, between_col, within_col, dv_col):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                             rightMargin=40, leftMargin=40,
+                             topMargin=50, bottomMargin=40)
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle('Title', parent=styles['Title'],
+                                  fontSize=16, fontName='Helvetica-Bold',
+                                  textColor=colors.HexColor('#1a1a2e'),
+                                  spaceAfter=6)
+    h2_style = ParagraphStyle('H2', parent=styles['Heading2'],
+                               fontSize=12, fontName='Helvetica-Bold',
+                               textColor=colors.HexColor('#1f6feb'),
+                               spaceAfter=4, spaceBefore=12)
+    body_style = ParagraphStyle('Body', parent=styles['Normal'],
+                                 fontSize=9, fontName='Helvetica',
+                                 leading=14, spaceAfter=4)
+    note_style = ParagraphStyle('Note', parent=styles['Normal'],
+                                 fontSize=8, fontName='Helvetica-Oblique',
+                                 textColor=colors.grey, leading=12)
+
+    def make_table(df, title=None):
+        items = []
+        if title:
+            items.append(Paragraph(title, h2_style))
+        data = [list(df.columns)]
+        for _, row in df.iterrows():
+            data.append([str(round(v, 3)) if isinstance(v, float) else str(v) for v in row])
+        t = Table(data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1f6feb')),
+            ('TEXTCOLOR',  (0,0), (-1,0), colors.white),
+            ('FONTNAME',   (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE',   (0,0), (-1,-1), 7.5),
+            ('ALIGN',      (0,0), (-1,-1), 'CENTER'),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f5f7fa')]),
+            ('GRID',       (0,0), (-1,-1), 0.3, colors.HexColor('#dddddd')),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ]))
+        items.append(t)
+        return items
+
+    story = []
+    story.append(Paragraph("Mixed-Design ANOVA (Split-Plot) Report", title_style))
+    story.append(Paragraph(f"Between-Subject Factor: <b>{between_col}</b> &nbsp;|&nbsp; "
+                            f"Within-Subject Factor: <b>{within_col}</b> &nbsp;|&nbsp; "
+                            f"Dependent Variable: <b>{dv_col}</b>", body_style))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#1f6feb')))
+    story.append(Spacer(1, 10))
+
+    # Descriptives
+    story += make_table(desc.round(3), "1. Descriptive Statistics")
+    story.append(Spacer(1, 8))
+
+    # Normality
+    story += make_table(norm_df.round(3), "2. Normality Tests")
+    story.append(Paragraph("Note: Shapiro-Wilk is used for n ≤ 50; Kolmogorov-Smirnov for n > 50.", note_style))
+    story.append(Spacer(1, 8))
+
+    # Levene
+    if not lev_df.empty:
+        story += make_table(lev_df.round(3), "3. Levene's Test of Equality of Variances")
+        story.append(Spacer(1, 8))
+
+    # ANOVA
+    story += make_table(aov.round(4), "4. Mixed-Design ANOVA Results")
+    story.append(Paragraph("η²ₚ: Partial Eta Squared · ε: Greenhouse-Geisser epsilon", note_style))
+    story.append(Spacer(1, 8))
+
+    # Interpretation
+    story.append(Paragraph("5. Statistical Interpretation", h2_style))
+    for line in interp_text.split('\n\n'):
+        clean = line.replace('**', '').replace('①', '①').replace('②', '②').replace('③', '③')
+        story.append(Paragraph(clean, body_style))
+        story.append(Spacer(1, 4))
+
+    story.append(Spacer(1, 12))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+    story.append(Paragraph("Generated by Mixed-Design ANOVA Analyzer · Powered by pingouin & Streamlit", note_style))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("""
+        <div style="padding:1rem 0;">
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:1.1rem;
+                        font-weight:600;color:#58a6ff;margin-bottom:4px;">
+                📊 Mixed ANOVA
+            </div>
+            <div style="font-size:0.75rem;color:#8b949e;">SPSS-Equivalent Analyzer</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        with st.expander("📖 User Guide", expanded=False):
+            st.markdown("""
+**What is Mixed-Design ANOVA?**
+Also called Split-Plot ANOVA, it analyzes designs with:
+- One **between-subjects** factor (independent groups)
+- One **within-subjects** factor (repeated measures / time)
+
+**Data Format (Wide)**
+Each row = one participant.
+| ID | Group | Pre | Post | Follow-up |
+|----|-------|-----|------|-----------|
+| S1 | A     | 45  | 60   | 55        |
+
+**Step-by-Step**
+1. Upload your CSV file
+2. Map columns (ID, Group, Time points)
+3. Click **Run Analysis**
+
+**Interpreting Results**
+- **p < .05** → statistically significant
+- **η²ₚ ≥ .14** → large effect
+- **Significant interaction** → groups differ in their change patterns over time
+
+**Assumption Checks**
+- *Normality*: SW (n≤50), KS (n>50)
+- *Homogeneity*: Levene's test
+- *Sphericity*: Mauchly's (time > 2 points); use GG/HF corrections if violated
+
+**Post-Hoc Tests**
+- Bonferroni: Conservative, controls family-wise error
+- Tukey HSD: Balanced, good for equal group sizes
+            """)
+
+        st.markdown("---")
+        st.markdown("<div style='font-size:0.8rem;color:#8b949e;'>📥 Sample Datasets</div>",
+                    unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            df2 = generate_sample_2x2()
+            st.download_button("2×2 Data", df2.to_csv(index=False),
+                                file_name="sample_2x2.csv", mime="text/csv",
+                                use_container_width=True, key="dl2x2")
+        with col2:
+            df3 = generate_sample_3x3()
+            st.download_button("3×3 Data", df3.to_csv(index=False),
+                                file_name="sample_3x3.csv", mime="text/csv",
+                                use_container_width=True, key="dl3x3")
+
+        st.markdown("---")
+        st.markdown("""
+        <div style="font-size:0.72rem;color:#484f58;line-height:1.6;">
+        <b style="color:#8b949e;">Statistical Engine</b><br>
+        pingouin · scipy · statsmodels<br><br>
+        <b style="color:#8b949e;">Sum of Squares</b><br>
+        Type III (SPSS-compatible)<br><br>
+        <b style="color:#8b949e;">Sphericity Correction</b><br>
+        Greenhouse-Geisser & Huynh-Feldt
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MAIN APP
+# ════════════════════════════════════════════════════════════════════════════
+
+def main():
+    render_sidebar()
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="main-header">
+        <h1>Mixed-Design ANOVA Analyzer</h1>
+        <p>Split-Plot ANOVA · SPSS-Level Statistical Analysis · Pingouin Engine</p>
+        <div style="margin-top:1rem;">
+            <span class="badge badge-green">Type III SS</span>
+            <span class="badge badge-blue">Sphericity Corrections</span>
+            <span class="badge badge-purple">Post-Hoc Tests</span>
+            <span class="badge badge-green">PDF Export</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── File Upload ───────────────────────────────────────────────────────────
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">① Data Input</div>', unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Upload Wide-Format CSV",
+        type=['csv'],
+        help="Each row = one participant. Columns: Subject ID, Group, and multiple time-point measurements."
+    )
+
+    if uploaded is None:
+        st.markdown("""
+        <div class="interp-box">
+        <b>No file uploaded yet.</b> Please upload a wide-format CSV, or download a sample dataset from the sidebar.<br><br>
+        <b>Expected format:</b><br>
+        <code>ID, Group, Time1, Time2, Time3, ...</code><br>
+        Each row represents one participant. Time columns contain numeric measurements.
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    try:
+        df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"❌ Could not read CSV: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # Show preview
+    with st.expander(f"📄 Data Preview — {df.shape[0]} rows × {df.shape[1]} columns", expanded=True):
+        st.dataframe(df.head(10), use_container_width=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Column Mapping ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">② Column Mapping</div>', unsafe_allow_html=True)
+
+    all_cols = list(df.columns)
+    num_cols = list(df.select_dtypes(include=[np.number]).columns)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        subject_col = st.selectbox("👤 Subject ID Column", all_cols,
+                                    index=0, key="subj")
+    with col2:
+        between_col = st.selectbox("👥 Between-Subjects Factor (Group)", all_cols,
+                                    index=min(1, len(all_cols)-1), key="between")
+    with col3:
+        within_cols = st.multiselect("🕐 Within-Subjects Columns (Time Points)",
+                                      [c for c in num_cols if c not in [subject_col, between_col]],
+                                      default=[c for c in num_cols if c not in [subject_col, between_col]][:3],
+                                      key="within")
+
+    # Options
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        dv_name  = st.text_input("📏 Dependent Variable Label", value="Score", key="dv")
+    with col5:
+        posthoc_method = st.selectbox("🔬 Post-Hoc Correction", ['bonf','tukey','holm','fdr_bh'],
+                                       format_func=lambda x: {'bonf':'Bonferroni','tukey':'Tukey HSD',
+                                                               'holm':'Holm','fdr_bh':'FDR (BH)'}[x],
+                                       key="ph_method")
+    with col6:
+        alpha_level = st.number_input("α Level", value=0.05, min_value=0.001,
+                                       max_value=0.20, step=0.01, key="alpha")
+
+    run_btn = st.button("▶  Run Mixed-Design ANOVA", type="primary", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not run_btn:
+        return
+
+    # ── Validation ────────────────────────────────────────────────────────────
+    if len(within_cols) < 2:
+        st.error("❌ Please select at least 2 time-point columns for the within-subjects factor.")
+        return
+
+    required = [subject_col, between_col] + within_cols
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        st.error(f"❌ Columns not found: {missing_cols}")
+        return
+
+    # Check numeric
+    for c in within_cols:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            st.error(f"❌ Column '{c}' is not numeric. Please check your data.")
+            return
+
+    # Drop missing
+    df_clean = df[required].dropna()
+    n_dropped = len(df) - len(df_clean)
+    if n_dropped > 0:
+        st.markdown(f'<div class="warn-box">⚠️ {n_dropped} rows with missing values were removed. N = {len(df_clean)}</div>',
+                    unsafe_allow_html=True)
+
+    if len(df_clean) < 6:
+        st.error("❌ Too few complete observations. Need at least 6.")
+        return
+
+    # ── Reshape to Long ───────────────────────────────────────────────────────
+    within_col = 'Time'
+    df_long = df_clean.melt(id_vars=[subject_col, between_col],
+                             value_vars=within_cols,
+                             var_name=within_col, value_name=dv_name)
+    df_long[within_col] = pd.Categorical(df_long[within_col], categories=within_cols, ordered=True)
+
+    n_total  = df_clean[subject_col].nunique()
+    n_groups = df_long[between_col].nunique()
+    n_times  = len(within_cols)
+
+    # ── Quick Stats ───────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div class="metric-grid">
+        <div class="metric-card"><div class="metric-val">{n_total}</div><div class="metric-label">Participants</div></div>
+        <div class="metric-card"><div class="metric-val">{n_groups}</div><div class="metric-label">Groups</div></div>
+        <div class="metric-card"><div class="metric-val">{n_times}</div><div class="metric-label">Time Points</div></div>
+        <div class="metric-card"><div class="metric-val">{n_total*n_times}</div><div class="metric-label">Total Observations</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # COMPUTE ALL STATISTICS
+    # ════════════════════════════════════════════════════════════════════════
+    with st.spinner("⚙️  Running statistical analysis…"):
+        try:
+            desc     = compute_descriptives(df_long, between_col, within_col, dv_name)
+            norm_df  = test_normality(df_long, between_col, within_col, dv_name)
+            lev_df   = test_levene(df_long, between_col, within_col, dv_name)
+            aov      = run_mixed_anova(df_long, subject_col, between_col, within_col, dv_name)
+            sph_res  = run_mauchly(df_long, subject_col, within_col, dv_name) if n_times > 2 else None
+            interp   = generate_interpretation(aov, desc, between_col, within_col, n_total)
+
+            # Check if interaction is significant
+            aov_src = [str(r).strip() for r in aov.get('Source', aov.get('source', [])).tolist()]
+            inter_row = aov[aov['Source'].astype(str).str.contains(r'\*|inter', case=False, na=False)]
+            int_p = inter_row['p_unc'].values[0] if not inter_row.empty else 1.0
+            run_ph = int_p < alpha_level
+
+            posthoc_df = run_posthoc(df_long, between_col, within_col,
+                                      dv_name, subject_col, posthoc_method) if run_ph else pd.DataFrame()
+
+        except Exception as e:
+            st.error(f"❌ Analysis failed: {e}")
+            st.exception(e)
+            return
+
+    st.success("✅ Analysis complete!")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TABS
+    # ════════════════════════════════════════════════════════════════════════
+    tabs = st.tabs([
+        "📋 Descriptives",
+        "🔍 Assumptions",
+        "📊 ANOVA Results",
+        "🔬 Post-Hoc",
+        "📈 Visualization",
+        "📝 Interpretation",
+        "⬇️ Export"
+    ])
+
+    # ─── Tab 1: Descriptives ─────────────────────────────────────────────────
+    with tabs[0]:
+        st.markdown('<div class="section-title">Descriptive Statistics by Group × Time</div>',
+                    unsafe_allow_html=True)
+        disp = desc.copy()
+        disp.columns = [c.replace(between_col, 'Group').replace(within_col, 'Time') for c in disp.columns]
+        for col in ['Mean','SD','SE','Min','Max','Median','95% CI Lower','95% CI Upper']:
+            if col in disp.columns:
+                disp[col] = disp[col].round(3)
+        st.dataframe(disp, use_container_width=True)
+
+        # Marginal means
+        st.markdown('<div class="section-title" style="margin-top:1.5rem;">Marginal Means</div>',
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**By Group**")
+            mg = df_long.groupby(between_col)[dv_name].agg(['mean','std','count']).round(3)
+            mg.columns = ['Mean','SD','N']
+            st.dataframe(mg, use_container_width=True)
+        with c2:
+            st.markdown("**By Time**")
+            mt = df_long.groupby(within_col)[dv_name].agg(['mean','std','count']).round(3)
+            mt.columns = ['Mean','SD','N']
+            st.dataframe(mt, use_container_width=True)
+
+    # ─── Tab 2: Assumptions ──────────────────────────────────────────────────
+    with tabs[1]:
+        st.markdown('<div class="section-title">A. Normality Tests</div>', unsafe_allow_html=True)
+
+        # Recommendation note
+        sw_n  = (norm_df['N'] <= 50).sum()
+        ks_n  = (norm_df['N'] > 50).sum()
+        st.markdown(f"""
+        <div class="interp-box">
+        <b>Automatic Test Selection:</b><br>
+        • <b>Shapiro-Wilk</b> (n ≤ 50): Applied to <b>{sw_n}</b> cells — preferred for small samples (highest power).<br>
+        • <b>Kolmogorov-Smirnov</b> (n > 50): Applied to <b>{ks_n}</b> cells — preferred for large samples.<br>
+        H₀: The data are normally distributed. Reject H₀ if <i>p</i> &lt; {alpha_level}.
+        </div>
+        """, unsafe_allow_html=True)
+
+        norm_show = norm_df.copy()
+        norm_show['Statistic'] = norm_show['Statistic'].round(4)
+        norm_show['p-value']   = norm_show['p-value'].apply(lambda x: fmt_p_val(x) if not pd.isna(x) else '—')
+        norm_show['Result']    = norm_show['Normal'].map({True:'✅ Normal', False:'⚠️ Non-Normal', None:'—'})
+        st.dataframe(norm_show[['Group','Time','N','Test','Statistic','p-value','Result','Recommendation']],
+                     use_container_width=True)
+
+        all_normal = norm_df['Normal'].dropna().all()
+        any_nonnormal = (~norm_df['Normal'].dropna()).any()
+        if all_normal:
+            st.markdown('<div class="ok-box">✅ All cells satisfy normality assumption (p > .05).</div>',
                         unsafe_allow_html=True)
-        elif df_ph_b.empty: st.warning("No comparisons computed.")
+        elif any_nonnormal:
+            st.markdown('<div class="warn-box">⚠️ Some cells show non-normality. '
+                        'ANOVA is generally robust to moderate violations (especially n > 15 per cell). '
+                        'Consider non-parametric alternatives (e.g., Friedman + Kruskal-Wallis) for severe violations.</div>',
+                        unsafe_allow_html=True)
+
+        st.markdown('<div class="section-title" style="margin-top:1.5rem;">B. Homogeneity of Variance (Levene\'s Test)</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="interp-box">
+        Tests whether variances are equal across groups at each time point.<br>
+        H₀: Variances are equal. Reject H₀ if <i>p</i> &lt; {alpha_level}.
+        </div>
+        """, unsafe_allow_html=True)
+
+        if not lev_df.empty:
+            lev_show = lev_df.copy()
+            lev_show['Levene F'] = lev_show['Levene F'].round(3)
+            lev_show['p-value']  = lev_show['p-value'].apply(fmt_p_val)
+            lev_show['Result']   = lev_show['Equal Variances'].map({True:'✅ Equal', False:'⚠️ Unequal'})
+            st.dataframe(lev_show, use_container_width=True)
+
+            if lev_df['Equal Variances'].all():
+                st.markdown('<div class="ok-box">✅ Homogeneity of variance is satisfied at all time points.</div>',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="warn-box">⚠️ Unequal variances detected at one or more time points. '
+                            'Interpret F-statistics with caution; consider Welch corrections.</div>',
+                            unsafe_allow_html=True)
+
+        if n_times > 2:
+            st.markdown('<div class="section-title" style="margin-top:1.5rem;">C. Sphericity (Mauchly\'s Test)</div>',
+                        unsafe_allow_html=True)
+            st.markdown("""
+            <div class="interp-box">
+            Sphericity requires equal variances of the differences between all pairs of time points.<br>
+            H₀: Sphericity is met. Reject H₀ if <i>p</i> &lt; .05.<br>
+            If violated, use <b>Greenhouse-Geisser (ε &lt; .75)</b> or <b>Huynh-Feldt (ε ≥ .75)</b> correction.
+            </div>
+            """, unsafe_allow_html=True)
+
+            if sph_res is not None:
+                try:
+                    sph_stat = sph_res[1] if isinstance(sph_res, tuple) else None
+                    gg_eps   = sph_res[2] if isinstance(sph_res, tuple) else None
+                    hf_eps   = sph_res[3] if isinstance(sph_res, tuple) else None
+                    sph_p    = sph_res[4] if isinstance(sph_res, tuple) else None
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Mauchly's W", fmt(sph_stat, 4) if sph_stat else "—")
+                    with col2:
+                        st.metric("p-value", fmt_p_val(sph_p) if sph_p else "—")
+                    with col3:
+                        st.metric("GG ε", fmt(gg_eps, 4) if gg_eps else "—")
+
+                    if sph_p is not None:
+                        if sph_p < .05:
+                            rec = "Greenhouse-Geisser" if (gg_eps or 1) < .75 else "Huynh-Feldt"
+                            st.markdown(f'<div class="warn-box">⚠️ Sphericity violated (p = {fmt_p_val(sph_p)}). '
+                                        f'<b>{rec} correction applied</b> (ε = {fmt(gg_eps,3)}).</div>',
+                                        unsafe_allow_html=True)
+                        else:
+                            st.markdown('<div class="ok-box">✅ Sphericity assumption satisfied (p > .05). '
+                                        'No correction needed.</div>', unsafe_allow_html=True)
+                except Exception:
+                    st.info("Mauchly's test result format could not be parsed. "
+                            "Greenhouse-Geisser correction is applied by default in pingouin.")
         else:
-            st.dataframe(df_ph_b,hide_index=True,use_container_width=True)
-            st.caption("Cohen's d: |d| < .20 negligible; .20–.49 small; .50–.79 medium; ≥ .80 large.")
-    with pt2:
-        st.markdown(f"Paired t-tests. Correction: **{corr_lbl}**.")
-        if b<3: st.markdown('<div class="abox-info">Only 2 levels — omnibus F-test is conclusive.</div>',
-                             unsafe_allow_html=True)
-        elif df_ph_w.empty: st.warning("No comparisons computed.")
-        else: st.dataframe(df_ph_w,hide_index=True,use_container_width=True)
-    with pt3:
-        st.markdown(
-            "**SPSS F-test method** — uses pooled error terms from the omnibus model.\n"
-            f"- Within (Time) at each group: F = MS_B@group / MS_BS(A), df = ({b-1}, {res['df_BSAc']:.2f})\n"
-            f"- Between ({grp_col}) at each time-point: F = MS_A@time / MS_S(A), df = ({a-1}, {res['df_SA']})"
+            st.info("ℹ️ Sphericity test not applicable for 2 time points.")
+
+    # ─── Tab 3: ANOVA Results ─────────────────────────────────────────────────
+    with tabs[2]:
+        st.markdown('<div class="section-title">Mixed-Design ANOVA Summary Table</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""
+        <div class="interp-box">
+        <b>Algorithm:</b> pingouin <code>mixed_anova()</code> · <b>Sum of Squares:</b> Type III (SPSS-compatible) · 
+        <b>Sphericity correction:</b> Greenhouse-Geisser (applied when ε &lt; 1.0)
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(render_anova_table(aov), unsafe_allow_html=True)
+
+        # Effect size legend
+        st.markdown("""
+        <div style="margin-top:1rem;padding:0.75rem 1rem;background:#161b22;border:1px solid #30363d;
+                    border-radius:8px;font-size:0.8rem;color:#8b949e;font-family:'IBM Plex Mono',monospace;">
+        <b style="color:#e6edf3;">Partial η² benchmarks (Cohen, 1988):</b> &nbsp;
+        <span style="color:#3fb950">Small: ≥ .01</span> &nbsp;|&nbsp;
+        <span style="color:#e3b341">Medium: ≥ .06</span> &nbsp;|&nbsp;
+        <span style="color:#f78166">Large: ≥ .14</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Full pingouin output
+        with st.expander("🔍 Full pingouin Output (Raw)"):
+            st.dataframe(aov, use_container_width=True)
+
+    # ─── Tab 4: Post-Hoc ─────────────────────────────────────────────────────
+    with tabs[3]:
+        if not run_ph:
+            st.markdown(f"""
+            <div class="interp-box">
+            ℹ️ Post-hoc tests were <b>not conducted</b> because the Group × Time interaction was 
+            not statistically significant (p = {fmt_p_val(int_p)}, α = {alpha_level}).<br><br>
+            Post-hoc tests are typically conducted only when the interaction or a main effect 
+            of interest is significant.
+            </div>
+            """, unsafe_allow_html=True)
+        elif posthoc_df.empty:
+            st.warning("Post-hoc comparisons could not be computed.")
+        else:
+            method_name = {'bonf':'Bonferroni','tukey':'Tukey HSD',
+                           'holm':'Holm','fdr_bh':'FDR (Benjamini-Hochberg)'}[posthoc_method]
+            st.markdown(f'<div class="section-title">Pairwise Comparisons ({method_name} Corrected)</div>',
+                        unsafe_allow_html=True)
+
+            # Between-group comparisons
+            ph_between = posthoc_df[posthoc_df['Comparison Type']=='Between-Groups'] if 'Comparison Type' in posthoc_df.columns else pd.DataFrame()
+            ph_within  = posthoc_df[posthoc_df['Comparison Type']=='Within-Time'] if 'Comparison Type' in posthoc_df.columns else pd.DataFrame()
+
+            if not ph_between.empty:
+                st.markdown("**Between-Group Comparisons at Each Time Point**")
+                show_cols = [c for c in ['Time Point','Group A','Group B','Mean Diff','SE','t','df','p (unadj)','p (adj)','Cohen d','Sig'] if c in ph_between.columns]
+                ph_b_show = ph_between[show_cols].copy()
+                for col in ['Mean Diff','SE','t','Cohen d']:
+                    if col in ph_b_show.columns:
+                        ph_b_show[col] = ph_b_show[col].round(3)
+                for col in ['p (unadj)','p (adj)']:
+                    if col in ph_b_show.columns:
+                        ph_b_show[col] = ph_b_show[col].apply(lambda x: fmt_p_val(x) if not pd.isna(x) else '—')
+                st.dataframe(ph_b_show, use_container_width=True)
+
+            if not ph_within.empty:
+                st.markdown("**Within-Subject Time Comparisons per Group**")
+                show_cols = [c for c in ['Group','Time A','Time B','Mean Diff','SE','t','df','p (unadj)','p (adj)','Cohen d','Sig'] if c in ph_within.columns]
+                ph_w_show = ph_within[show_cols].copy()
+                for col in ['Mean Diff','SE','t','Cohen d']:
+                    if col in ph_w_show.columns:
+                        ph_w_show[col] = ph_w_show[col].round(3)
+                for col in ['p (unadj)','p (adj)']:
+                    if col in ph_w_show.columns:
+                        ph_w_show[col] = ph_w_show[col].apply(lambda x: fmt_p_val(x) if not pd.isna(x) else '—')
+                st.dataframe(ph_w_show, use_container_width=True)
+
+            st.markdown("""
+            <div style="font-size:0.78rem;color:#8b949e;margin-top:0.5rem;">
+            *** p &lt; .001 · ** p &lt; .01 · * p &lt; .05 · † p &lt; .10 · ns p ≥ .10
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ─── Tab 5: Visualization ─────────────────────────────────────────────────
+    with tabs[4]:
+        st.markdown('<div class="section-title">Profile Plot (Interaction Plot)</div>',
+                    unsafe_allow_html=True)
+        fig = make_interaction_plot(desc, between_col, within_col,
+                                     title=f"Profile Plot: {dv_name} by {between_col} × Time")
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+        # Distribution plots
+        st.markdown('<div class="section-title" style="margin-top:1.5rem;">Distribution by Group × Time</div>',
+                    unsafe_allow_html=True)
+        plt.style.use('dark_background')
+        n_t = len(within_cols)
+        fig2, axes2 = plt.subplots(1, n_t, figsize=(5*n_t, 4), sharey=True)
+        fig2.patch.set_facecolor('#0d1117')
+        if n_t == 1:
+            axes2 = [axes2]
+        palette = ['#58a6ff','#3fb950','#bc8cff','#e3b341','#f78166']
+        groups  = df_long[between_col].unique()
+
+        for ax, t in zip(axes2, within_cols):
+            sub = df_long[df_long[within_col]==t]
+            ax.set_facecolor('#161b22')
+            ax.spines['bottom'].set_color('#30363d')
+            ax.spines['left'].set_color('#30363d')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.tick_params(colors='#8b949e', labelsize=8)
+            for i, g in enumerate(groups):
+                d = sub[sub[between_col]==g][dv_name].dropna()
+                ax.hist(d, bins=12, alpha=0.55, color=palette[i % len(palette)],
+                        label=str(g), edgecolor='#0d1117', linewidth=0.4)
+            ax.set_title(str(t), color='#e6edf3', fontsize=10)
+            ax.set_xlabel(dv_name, color='#8b949e', fontsize=9)
+            ax.grid(axis='y', color='#21262d', alpha=0.6, linewidth=0.5)
+        axes2[0].legend(title=between_col, fontsize=8, facecolor='#21262d',
+                         edgecolor='#30363d', labelcolor='#c9d1d9')
+        plt.tight_layout()
+        st.pyplot(fig2, use_container_width=True)
+        plt.close(fig2)
+
+    # ─── Tab 6: Interpretation ────────────────────────────────────────────────
+    with tabs[5]:
+        st.markdown('<div class="section-title">Automated Statistical Interpretation</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f'<div class="interp-box">{interp.replace(chr(10), "<br>")}</div>',
+                    unsafe_allow_html=True)
+
+        # APA-style report
+        st.markdown('<div class="section-title" style="margin-top:1.5rem;">APA-Style Results Write-Up</div>',
+                    unsafe_allow_html=True)
+        src_names = aov['Source'].astype(str).tolist() if 'Source' in aov.columns else []
+        inter_src = next((s for s in src_names if '*' in s or 'inter' in s.lower()), None)
+        if inter_src:
+            ir = aov[aov['Source']==inter_src].iloc[0]
+            F_i  = ir.get('F', np.nan)
+            df1  = ir.get('ddof1', ir.get('DF', np.nan))
+            df2  = ir.get('ddof2', np.nan)
+            p_i  = ir.get('p_unc', ir.get('p-unc', ir.get('p-GG-corr', np.nan)))
+            eta_i= ir.get('np2', np.nan)
+            apa  = (f"A {n_groups}-group (between) × {n_times}-time (within) mixed-design ANOVA "
+                    f"was conducted with {n_total} participants. "
+                    f"The Group × Time interaction was "
+                    f"{'significant' if p_i < alpha_level else 'not significant'}, "
+                    f"F({fmt(df1,0)}, {fmt(df2,0)}) = {fmt(F_i,2)}, p = {fmt_p_val(p_i)}, "
+                    f"η²ₚ = {fmt(eta_i,3)}.")
+            st.info(apa)
+
+    # ─── Tab 7: Export ────────────────────────────────────────────────────────
+    with tabs[6]:
+        st.markdown('<div class="section-title">Download Statistical Report</div>',
+                    unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+
+        # CSV Export
+        with col1:
+            st.markdown("**📄 CSV Export**")
+            csv_buf = io.StringIO()
+            csv_buf.write("Mixed-Design ANOVA Report\n\n")
+            csv_buf.write("DESCRIPTIVE STATISTICS\n")
+            desc.to_csv(csv_buf, index=False)
+            csv_buf.write("\n\nNORMALITY TESTS\n")
+            norm_df.to_csv(csv_buf, index=False)
+            csv_buf.write("\n\nLEVENE'S TEST\n")
+            lev_df.to_csv(csv_buf, index=False)
+            csv_buf.write("\n\nANOVA RESULTS\n")
+            aov.to_csv(csv_buf, index=False)
+            if not posthoc_df.empty:
+                csv_buf.write("\n\nPOST-HOC TESTS\n")
+                posthoc_df.to_csv(csv_buf, index=False)
+            csv_buf.write("\n\nINTERPRETATION\n")
+            csv_buf.write(interp.replace('**',''))
+            csv_data = csv_buf.getvalue().encode()
+
+            st.download_button(
+                label="⬇️ Download CSV Report",
+                data=csv_data,
+                file_name="mixed_anova_report.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        # PDF Export
+        with col2:
+            st.markdown("**📑 PDF Export**")
+            try:
+                pdf_data = generate_pdf_report(
+                    desc, norm_df, lev_df, aov, interp, between_col, within_col, dv_name
+                )
+                st.download_button(
+                    label="⬇️ Download PDF Report",
+                    data=pdf_data,
+                    file_name="mixed_anova_report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.error(f"PDF generation failed: {e}")
+
+        # Long-format data
+        st.markdown("**📊 Processed Long-Format Data**")
+        st.download_button(
+            label="⬇️ Download Long-Format CSV",
+            data=df_long.to_csv(index=False).encode(),
+            file_name="long_format_data.csv",
+            mime="text/csv",
+            use_container_width=True
         )
-        se_out=res["se_df"].drop(columns=["_p_raw"],errors="ignore")
-        st.dataframe(se_out,hide_index=True,use_container_width=True)
 
-    # ── Interpretation ─────────────────────────────────────────────────────────
-    st.markdown('<div class="sec">Statistical Interpretation</div>', unsafe_allow_html=True)
 
-    def interp_p(res,grp_col,alpha,pref):
-        texts=[]
-        def es(np2,eta2):
-            cf=cohen_f_es(np2)
-            if pref=="partial_eta2": return f"partial η²p = {np2:.3f} ({magnitude(np2,'partial_eta2')} effect)"
-            elif pref=="eta2":       return f"η² = {eta2:.3f} ({magnitude(eta2,'eta2')} effect)"
-            else:                    return f"Cohen's f = {cf:.3f} ({magnitude(cf,'cohen_f')} effect)"
-
-        sig_A=res["p_A"]<alpha
-        es_A=es(res["np2_A"],res["eta2_A"])
-        if sig_A:
-            texts.append(f"<b>Main Effect of {grp_col} (Between-Subjects):</b> Statistically significant, "
-                f"F({res['df_A']:.0f}, {res['df_SA']:.0f}) = {res['F_A']:.3f}, p {fmt_p(res['p_A'])}, "
-                f"{es_A}; observed power = {res['pw_A']:.3f}. Group means on the dependent variable "
-                f"differ significantly when averaging across time-points. "
-                f"Post-hoc comparisons identify which groups differ.")
-        else:
-            texts.append(f"<b>Main Effect of {grp_col} (Between-Subjects):</b> Not statistically significant, "
-                f"F({res['df_A']:.0f}, {res['df_SA']:.0f}) = {res['F_A']:.3f}, p {fmt_p(res['p_A'])}, "
-                f"{es_A}; observed power = {res['pw_A']:.3f}. "
-                f"Insufficient evidence that groups differ when averaging across time.")
-
-        sph_note=""
-        if sph and eps<1.0:
-            sph_note=f" df adjusted via {sph_label} (ε = {eps:.4f})."
-        sig_B=res["p_B"]<alpha
-        es_B=es(res["np2_B"],res["eta2_B"])
-        if sig_B:
-            texts.append(f"<b>Main Effect of Time (Within-Subjects):</b> Statistically significant, "
-                f"F({res['df_Bc']:.3f}, {res['df_BSAc']:.3f}) = {res['F_B']:.3f}, p {fmt_p(res['p_B'])}, "
-                f"{es_B}{sph_note}; observed power = {res['pw_B']:.3f}. "
-                f"Scores change significantly across time-points when averaging across groups.")
-        else:
-            texts.append(f"<b>Main Effect of Time (Within-Subjects):</b> Not statistically significant, "
-                f"F({res['df_Bc']:.3f}, {res['df_BSAc']:.3f}) = {res['F_B']:.3f}, p {fmt_p(res['p_B'])}, "
-                f"{es_B}{sph_note}; observed power = {res['pw_B']:.3f}. "
-                f"No significant change in scores across time-points detected.")
-
-        sig_AB=res["p_AB"]<alpha
-        es_AB=es(res["np2_AB"],res["eta2_AB"])
-        if sig_AB:
-            texts.append(f"<b>{grp_col} × Time Interaction:</b> Statistically significant, "
-                f"F({res['df_ABc']:.3f}, {res['df_BSAc']:.3f}) = {res['F_AB']:.3f}, p {fmt_p(res['p_AB'])}, "
-                f"{es_AB}; observed power = {res['pw_AB']:.3f}. "
-                f"The effect of time on the dependent variable differs across {grp_col} groups (non-parallel profiles). "
-                f"<b>Caution:</b> interpret main effects in the context of this significant interaction. "
-                f"Examine the profile plot and simple-effects analysis.")
-        else:
-            texts.append(f"<b>{grp_col} × Time Interaction:</b> Not statistically significant, "
-                f"F({res['df_ABc']:.3f}, {res['df_BSAc']:.3f}) = {res['F_AB']:.3f}, p {fmt_p(res['p_AB'])}, "
-                f"{es_AB}; observed power = {res['pw_AB']:.3f}. "
-                f"The pattern of change across time is consistent (parallel) across {grp_col} groups. "
-                f"Main effects may be interpreted independently.")
-
-        low=[nm for nm,pw in [(grp_col,res["pw_A"]),("Time",res["pw_B"]),(f"{grp_col}×Time",res["pw_AB"])]
-             if not np.isnan(pw) and pw<0.80]
-        if low:
-            texts.append(f"<b>Statistical Power Notice:</b> Observed power < 0.80 for: {', '.join(low)}. "
-                f"Increased Type II error risk. Consider a larger sample size.")
-        return texts
-
-    for txt in interp_p(res,grp_col,alpha_level,effect_pref):
-        st.markdown(f'<div class="ibox">{txt}</div>',unsafe_allow_html=True)
-
-    with st.expander("APA 7th Edition Reporting Template",expanded=False):
-        apa=(f"A {a} ({grp_col}) × {b} (time) mixed ANOVA was conducted "
-             f"(N = {N}). "
-             f"The main effect of {grp_col} was "
-             f"{'significant' if res['p_A']<alpha_level else 'not significant'}, "
-             f"F({res['df_A']:.0f}, {res['df_SA']:.0f}) = {res['F_A']:.2f}, "
-             f"p {fmt_p(res['p_A'])}, partial η²p = {res['np2_A']:.3f}. "
-             f"The main effect of time was "
-             f"{'significant' if res['p_B']<alpha_level else 'not significant'}, "
-             f"F({res['df_Bc']:.2f}, {res['df_BSAc']:.2f}) = {res['F_B']:.2f}, "
-             f"p {fmt_p(res['p_B'])}, partial η²p = {res['np2_B']:.3f}. "
-             f"The {grp_col} × time interaction was "
-             f"{'significant' if res['p_AB']<alpha_level else 'not significant'}, "
-             f"F({res['df_ABc']:.2f}, {res['df_BSAc']:.2f}) = {res['F_AB']:.2f}, "
-             f"p {fmt_p(res['p_AB'])}, partial η²p = {res['np2_AB']:.3f}.")
-        st.text_area("APA result:",value=apa,height=160)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ════════  NON-PARAMETRIC OUTPUT  ════════
-# ══════════════════════════════════════════════════════════════════════════════
-else:
-    st.markdown('<div class="sec-np">Non-Parametric Analysis Results</div>',
-                unsafe_allow_html=True)
-    st.markdown(
-        '<div class="ibox-np"><b>Non-parametric path selected.</b> '
-        'Because the normality assumption was violated, the following non-parametric tests '
-        'are reported: '
-        '<b>Friedman test</b> for within-subjects repeated-measures (equivalent to repeated-measures ANOVA), '
-        '<b>Kruskal–Wallis test</b> for between-subjects comparisons (equivalent to one-way ANOVA), '
-        'with <b>Wilcoxon signed-rank</b> (within) and <b>Mann–Whitney U</b> (between) post-hoc tests. '
-        'Effect sizes: Kendall\'s W (Friedman), rank-biserial r (Mann–Whitney/Wilcoxon).</div>',
-        unsafe_allow_html=True)
-
-    # ── Descriptives ───────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Descriptive Statistics (Median, IQR)</div>',
-                unsafe_allow_html=True)
-    st.dataframe(np_res["desc_df"],hide_index=True,use_container_width=True)
-    st.caption("Non-parametric path uses median and IQR as central tendency / spread measures.")
-
-    # ── Friedman ───────────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Friedman Test (Within-Subjects — Per Group)</div>',
-                unsafe_allow_html=True)
-    npc1,npc2=st.columns([2,1])
-    with npc1:
-        st.dataframe(np_res["fried_df"].drop(columns=["_p"]),
-                     hide_index=True,use_container_width=True)
-        st.caption("Kendall's W: 0.10 = small, 0.30 = medium, 0.50 = large.")
-    with npc2:
-        st.markdown(
-            f'<div class="npcard"><div class="lbl">Omnibus Friedman (all subjects)</div>'
-            f'<div class="val">χ²({b-1}) = {np_res["chi2_all"]:.3f}</div>'
-            f'<div class="sub">{pill(np_res["p_all"],alpha_level)}</div>'
-            f'<div class="sub" style="margin-top:5px;">Kendall\'s W = {np_res["W_k_all"]:.4f}</div>'
-            f'</div>',unsafe_allow_html=True)
-
-    # ── Kruskal–Wallis ─────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Kruskal–Wallis Test (Between-Subjects — Per Time-Point)</div>',
-                unsafe_allow_html=True)
-    npc3,npc4=st.columns([2,1])
-    with npc3:
-        st.dataframe(np_res["kw_df"].drop(columns=["_p"]),
-                     hide_index=True,use_container_width=True)
-        st.caption("η² approximation: (H − k + 1) / (N − k).")
-    with npc4:
-        st.markdown(
-            f'<div class="npcard"><div class="lbl">Omnibus Kruskal–Wallis</div>'
-            f'<div class="val">H({a-1}) = {np_res["H_all"]:.3f}</div>'
-            f'<div class="sub">{pill(np_res["p_kw_all"],alpha_level)}</div>'
-            f'</div>',unsafe_allow_html=True)
-
-    # ── Wilcoxon post-hoc ──────────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Wilcoxon Signed-Rank Post-Hoc (Within, per Group)</div>',
-                unsafe_allow_html=True)
-    if np_res["wilc_df"].empty: st.info("Not enough data for Wilcoxon post-hoc.")
-    else:
-        st.dataframe(np_res["wilc_df"],hide_index=True,use_container_width=True)
-        st.caption("Rank-biserial r: |r| < .10 negligible; .10–.29 small; .30–.49 medium; ≥ .50 large.")
-
-    # ── Mann–Whitney post-hoc ──────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Mann–Whitney U Post-Hoc (Between Groups, per Time-Point)</div>',
-                unsafe_allow_html=True)
-    if np_res["mw_df"].empty: st.info("Not enough data for Mann–Whitney post-hoc.")
-    else:
-        st.dataframe(np_res["mw_df"],hide_index=True,use_container_width=True)
-        st.caption(f"p-values corrected using {posthoc_method}. "
-                   "Rank-biserial r: |r| < .10 negligible; .10–.29 small; .30–.49 medium; ≥ .50 large.")
-
-    # ── Interpretation ─────────────────────────────────────────────────────────
-    st.markdown('<div class="sec-np">Statistical Interpretation</div>', unsafe_allow_html=True)
-    np_texts=[]
-    # Friedman
-    for _,row in np_res["fried_df"].iterrows():
-        sig=row["_p"]<alpha_level
-        w_lbl="large" if row["Kendall's W"]>=.50 else "medium" if row["Kendall's W"]>=.30 else "small" if row["Kendall's W"]>=.10 else "negligible"
-        kw_val = row["Kendall's W"]
-        chi2_val = row["Friedman χ²"]
-        p_val_str = row["p-value"]
-        g_name = row[grp_col]
-        if sig:
-            np_texts.append(
-                f"<b>Friedman Test — {grp_col} = {g_name}:</b> Statistically significant, "
-                f"\u03c7\u00b2({b-1}) = {chi2_val}, p {p_val_str}, "
-                f"Kendall\u2019s W = {kw_val} ({w_lbl} effect). "
-                f"Scores differ significantly across time-points within the {g_name} group.")
-        else:
-            np_texts.append(
-                f"<b>Friedman Test — {grp_col} = {g_name}:</b> Not statistically significant, "
-                f"\u03c7\u00b2({b-1}) = {chi2_val}, p {p_val_str}, "
-                f"Kendall\u2019s W = {kw_val} ({w_lbl} effect). "
-                f"No significant difference across time-points in the {g_name} group.")
-    # KW omnibus
-    sig_kw=np_res["p_kw_all"]<alpha_level
-    if sig_kw:
-        np_texts.append(f"<b>Kruskal–Wallis Test (omnibus between-subjects):</b> Statistically significant, "
-            f"H({a-1}) = {np_res['H_all']:.3f}, p {fmt_p(np_res['p_kw_all'])}. "
-            f"At least one group differs from the others. Mann–Whitney post-hoc identifies specific pairs.")
-    else:
-        np_texts.append(f"<b>Kruskal–Wallis Test (omnibus between-subjects):</b> Not statistically significant, "
-            f"H({a-1}) = {np_res['H_all']:.3f}, p {fmt_p(np_res['p_kw_all'])}. "
-            f"No significant between-group difference detected.")
-    for txt in np_texts:
-        st.markdown(f'<div class="ibox-np">{txt}</div>',unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  VISUALISATIONS (both paths)
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">Visualisations</div>', unsafe_allow_html=True)
-
-sns.set_style(grid_style); sns.set_context("notebook",font_scale=1.0)
-colors=sns.color_palette(pal_name,n_colors=max(a,3))
-
-with st.spinner("Rendering plots …"):
-    fig=plt.figure(figsize=(20,13)); fig.patch.set_facecolor("#f7f9fc")
-    gs=mgs.GridSpec(2,3,figure=fig,hspace=0.46,wspace=0.34)
-
-    # ── Profile Plot ─────────────────────────────────────────────────────────
-    ax1=fig.add_subplot(gs[0,:2])
-    if PARAMETRIC:
-        emm_plot=res["emm_df"].copy()
-        emm_plot.columns=[grp_col,"Time","N","Mean","SE","CI_lo","CI_hi"]
-        for i,g in enumerate(groups_list):
-            sub=emm_plot[emm_plot[grp_col]==g]
-            lo=sub["Mean"]-sub["CI_lo"]; hi=sub["CI_hi"]-sub["Mean"]
-            ax1.errorbar(range(b),sub["Mean"],[lo,hi],
-                         marker="o",ms=7,lw=2.4,capsize=5,capthick=1.8,
-                         color=colors[i],label=str(g),zorder=4)
-        ax1.set_xticks(range(b)); ax1.set_xticklabels(time_cols,rotation=20 if b>4 else 0)
-        ax1.set_title(f"Profile Plot (EMM ± {int(100*(1-alpha_level))}% CI)",
-                      fontsize=11.5,fontweight="bold",pad=10)
-        ax1.set_ylabel("Estimated Marginal Mean",fontsize=10.5)
-    else:
-        for i,g in enumerate(groups_list):
-            sub=df_wide[df_wide[grp_col]==g][time_cols]
-            meds=sub.median(); q1=sub.quantile(.25); q3=sub.quantile(.75)
-            ax1.plot(range(b),meds,marker="o",ms=7,lw=2.4,color=colors[i],label=str(g))
-            ax1.fill_between(range(b),q1,q3,alpha=0.2,color=colors[i])
-        ax1.set_xticks(range(b)); ax1.set_xticklabels(time_cols,rotation=20 if b>4 else 0)
-        ax1.set_title("Profile Plot (Median ± IQR shaded — Non-parametric)",
-                      fontsize=11.5,fontweight="bold",pad=10)
-        ax1.set_ylabel("Median",fontsize=10.5)
-    ax1.set_xlabel("Time-point",fontsize=10.5)
-    ax1.legend(title=grp_col,framealpha=0.9,fontsize=9)
-    ax1.grid(True,alpha=0.28,linestyle="--"); ax1.set_facecolor("#ffffff")
-
-    # ── Bar Chart ─────────────────────────────────────────────────────────────
-    ax2=fig.add_subplot(gs[0,2])
-    w_pos=np.arange(b); bw=0.80/a
-    for i,g in enumerate(groups_list):
-        if PARAMETRIC:
-            emm_g=res["emm_df"].copy()
-            emm_g.columns=[grp_col,"Time","N","Mean","SE","CI_lo","CI_hi"]
-            sub=emm_g[emm_g[grp_col]==g].set_index("Time").reindex(time_cols)
-            ci_err=np.array([sub["Mean"]-sub["CI_lo"],sub["CI_hi"]-sub["Mean"]])
-            ax2.bar(w_pos+(i-a/2+0.5)*bw,sub["Mean"],bw*0.90,
-                    yerr=ci_err,color=colors[i],label=str(g),alpha=0.85,
-                    capsize=4,error_kw={"elinewidth":1.5,"ecolor":"#333","alpha":.65})
-        else:
-            meds=df_wide[df_wide[grp_col]==g][time_cols].median()
-            ax2.bar(w_pos+(i-a/2+0.5)*bw,meds[time_cols].values,bw*0.90,
-                    color=colors[i],label=str(g),alpha=0.85)
-    ax2.set_xticks(w_pos)
-    ax2.set_xticklabels(time_cols,rotation=22 if b>3 else 0,ha="right" if b>3 else "center")
-    ax2.set_title("Mean/Median per Cell",fontsize=11.5,fontweight="bold",pad=10)
-    ax2.set_xlabel("Time-point",fontsize=10.5)
-    ax2.legend(title=grp_col,fontsize=8.5,framealpha=0.9)
-    ax2.grid(True,alpha=0.28,linestyle="--",axis="y"); ax2.set_facecolor("#ffffff")
-
-    # ── Box Plot ──────────────────────────────────────────────────────────────
-    ax3=fig.add_subplot(gs[1,0])
-    df_box=df_long.copy()
-    df_box["Cell"]=df_box[grp_col].astype(str)+"\n"+df_box["_time_"].astype(str)
-    c_ord=[f"{g}\n{t}" for g in groups_list for t in time_cols]
-    cmap={f"{g}\n{t}":colors[i] for i,g in enumerate(groups_list) for t in time_cols}
-    sns.boxplot(data=df_box,x="Cell",y="_y_",order=c_ord,palette=cmap,ax=ax3,
-                linewidth=1.1,flierprops=dict(marker="o",ms=3.5,alpha=0.5))
-    ax3.set_title("Distribution per Cell",fontsize=11.5,fontweight="bold",pad=10)
-    ax3.set_xlabel(""); ax3.set_ylabel("Score",fontsize=10.5)
-    ax3.tick_params(axis="x",labelsize=7.5 if a*b>6 else 9)
-    ax3.grid(True,alpha=0.28,linestyle="--",axis="y"); ax3.set_facecolor("#ffffff")
-
-    # ── Violin ────────────────────────────────────────────────────────────────
-    ax4=fig.add_subplot(gs[1,1])
-    sns.violinplot(data=df_long,x="_time_",y="_y_",hue=grp_col,
-                   order=time_cols,palette=pal_name,inner="quartile",
-                   ax=ax4,alpha=0.78,linewidth=1.0)
-    ax4.set_title("Score Distribution (Violin)",fontsize=11.5,fontweight="bold",pad=10)
-    ax4.set_xlabel("Time-point",fontsize=10.5); ax4.set_ylabel("Score",fontsize=10.5)
-    h,l=ax4.get_legend_handles_labels()
-    ax4.legend(h[:a],l[:a],title=grp_col,fontsize=8.5,framealpha=0.9)
-    ax4.grid(True,alpha=0.28,linestyle="--",axis="y"); ax4.set_facecolor("#ffffff")
-
-    # ── Effect / Test Size ────────────────────────────────────────────────────
-    ax5=fig.add_subplot(gs[1,2])
-    if PARAMETRIC:
-        eff_l=[grp_col,"Time",f"{grp_col}\n×Time"]
-        eff_v=[res["np2_A"],res["np2_B"],res["np2_AB"]]
-        eff_p=[res["p_A"],res["p_B"],res["p_AB"]]
-        ec=[colors[0] if p<alpha_level else "#9e9e9e" for p in eff_p]
-        bars=ax5.barh(eff_l,eff_v,color=ec,height=0.42,alpha=0.88)
-        for xv,lb in [(0.01,"small"),(0.06,"medium"),(0.14,"large")]:
-            ax5.axvline(xv,ls="--",lw=1.1,color="#777",alpha=0.7)
-            ax5.text(xv,2.65,lb,ha="center",fontsize=7,color="#555",va="bottom")
-        for bar,val,p_ in zip(bars,eff_v,eff_p):
-            mk="  *" if p_<alpha_level else "  n.s."
-            ax5.text(val+0.003,bar.get_y()+bar.get_height()/2,
-                     f"{val:.4f}{mk}",va="center",fontsize=9,fontweight="bold")
-        ax5.set_title("Partial η²p Effect Sizes\n(* = significant at α)",
-                      fontsize=11.5,fontweight="bold",pad=10)
-        ax5.set_xlabel("Partial η²p",fontsize=10.5)
-        ax5.set_xlim(0,max(max(eff_v)*1.38,0.22))
-    else:
-        # Kendall's W for each group
-        w_vals=np_res["fried_df"]["Kendall's W"].values
-        w_lbls=[str(x) for x in np_res["fried_df"][grp_col].values]
-        w_pv=np_res["fried_df"]["_p"].values
-        ec_np=[colors[i] if p<alpha_level else "#9e9e9e" for i,p in enumerate(w_pv)]
-        bars2=ax5.barh(w_lbls,w_vals,color=ec_np,height=0.42,alpha=0.88)
-        for xv,lb in [(0.10,"small"),(0.30,"medium"),(0.50,"large")]:
-            ax5.axvline(xv,ls="--",lw=1.1,color="#777",alpha=0.7)
-            ax5.text(xv,len(w_lbls)-0.35,lb,ha="center",fontsize=7,color="#555",va="bottom")
-        for bar,val in zip(bars2,w_vals):
-            ax5.text(val+0.01,bar.get_y()+bar.get_height()/2,
-                     f"{val:.3f}",va="center",fontsize=9,fontweight="bold")
-        ax5.set_title("Kendall's W Effect Size\n(Friedman — per group)",
-                      fontsize=11.5,fontweight="bold",pad=10)
-        ax5.set_xlabel("Kendall's W",fontsize=10.5)
-        ax5.set_xlim(0,1.1)
-    ax5.set_facecolor("#ffffff"); ax5.grid(True,alpha=0.28,linestyle="--",axis="x")
-
-    path_lbl="Parametric: Mixed ANOVA" if PARAMETRIC else "Non-Parametric: Friedman + Kruskal–Wallis"
-    fig.suptitle(f"Mixed Design Analysis — {grp_col} (between) × Time (within)  |  "
-                 f"N = {N}  |  {path_lbl}",
-                 fontsize=12.5,fontweight="bold",y=1.012,color="#0d1b2a")
-
-st.pyplot(fig,use_container_width=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DOWNLOADS
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">Download Results</div>', unsafe_allow_html=True)
-dl1,dl2,dl3=st.columns(3)
-
-with dl1:
-    if PARAMETRIC:
-        at_df_dl=pd.DataFrame(at)
-        st.download_button("📄  ANOVA Table (CSV)",
-                           at_df_dl.to_csv(index=False).encode(),
-                           "mixed_anova_table.csv","text/csv",use_container_width=True)
-    else:
-        combined=pd.concat([np_res["fried_df"].drop(columns=["_p"],errors="ignore"),
-                            np_res["kw_df"].drop(columns=["_p"],errors="ignore")],
-                           ignore_index=True)
-        st.download_button("📄  Test Results (CSV)",
-                           combined.to_csv(index=False).encode(),
-                           "nonparametric_results.csv","text/csv",use_container_width=True)
-with dl2:
-    fig_buf=io.BytesIO()
-    fig.savefig(fig_buf,format="png",dpi=200,bbox_inches="tight",facecolor="#f7f9fc")
-    fig_buf.seek(0)
-    st.download_button("🖼️  Figures (PNG, 200 dpi)",fig_buf.getvalue(),
-                       "figures.png","image/png",use_container_width=True)
-with dl3:
-    # Build Word report
-    doc=Document()
-    for sec in doc.sections:
-        sec.top_margin=sec.bottom_margin=Inches(1.0)
-        sec.left_margin=sec.right_margin=Inches(1.2)
-    h=doc.add_heading("Mixed Design Analysis Report",0)
-    h.alignment=WD_ALIGN_PARAGRAPH.CENTER
-    h.runs[0].font.color.rgb=RGBColor(0x0d,0x1b,0x2a)
-    doc.add_paragraph(
-        f"Analysis path: {'Parametric — Mixed ANOVA' if PARAMETRIC else 'Non-Parametric — Friedman + Kruskal–Wallis'}  |  "
-        f"Between factor: {grp_col}  |  Within: Time ({', '.join(time_cols)})  |  "
-        f"N = {N}  |  α = {alpha_level}"
-    ).alignment=WD_ALIGN_PARAGRAPH.CENTER
-    doc.add_paragraph()
-    doc.add_heading("1.  Normality Test (Shapiro–Wilk)",level=1)
-    doc.add_paragraph(
-        f"{'All cells satisfied normality (p ≥ ' + str(norm_alpha) + '); parametric path selected.' if PARAMETRIC else 'Normality violated in at least one cell (p < ' + str(norm_alpha) + '); non-parametric path selected.'}"
-    )
-    if PARAMETRIC:
-        doc.add_heading("2.  Mixed ANOVA Summary",level=1)
-        doc.add_paragraph(
-            f"F_between({res['df_A']:.0f},{res['df_SA']:.0f}) = {res['F_A']:.4f}, p {fmt_p(res['p_A'])}, partial η²p = {res['np2_A']:.4f}. "
-            f"F_within({res['df_Bc']:.3f},{res['df_BSAc']:.3f}) = {res['F_B']:.4f}, p {fmt_p(res['p_B'])}, partial η²p = {res['np2_B']:.4f}. "
-            f"F_interaction({res['df_ABc']:.3f},{res['df_BSAc']:.3f}) = {res['F_AB']:.4f}, p {fmt_p(res['p_AB'])}, partial η²p = {res['np2_AB']:.4f}."
-        )
-    else:
-        doc.add_heading("2.  Non-Parametric Test Summary",level=1)
-        doc.add_paragraph(
-            f"Omnibus Friedman: χ²({b-1}) = {np_res['chi2_all']:.4f}, p {fmt_p(np_res['p_all'])}, Kendall's W = {np_res['W_k_all']:.4f}. "
-            f"Omnibus Kruskal–Wallis: H({a-1}) = {np_res['H_all']:.4f}, p {fmt_p(np_res['p_kw_all'])}."
-        )
-    doc.add_heading("3.  Figures",level=1)
-    img_buf2=io.BytesIO()
-    fig.savefig(img_buf2,format="png",dpi=150,bbox_inches="tight",facecolor="#f7f9fc")
-    img_buf2.seek(0)
-    doc.add_picture(img_buf2,width=Inches(6.2))
-    doc.add_paragraph("Figure 1. Analysis visualisation panel.").alignment=WD_ALIGN_PARAGRAPH.CENTER
-    word_buf=io.BytesIO(); doc.save(word_buf); word_buf.seek(0)
-    st.download_button("📝  Report (Word .docx)",word_buf.getvalue(),
-                       "analysis_report.docx",
-                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                       use_container_width=True)
-
-st.markdown("---")
-st.caption(
-    "Mixed ANOVA Calculator · SPSS GLM Repeated Measures Equivalent · Wide-Format Input · "
-    "Auto Parametric/Non-Parametric Routing · SS decomposition verified (= SS_Total) · "
-    "References: Winer, Brown & Michels (1991); Mauchly (1940); Box (1954); "
-    "Greenhouse & Geisser (1959); Huynh & Feldt (1976); Lecoutre (1991); Cohen (1988); "
-    "Friedman (1937); Kruskal & Wallis (1952); Wilcoxon (1945); Mann & Whitney (1947)."
-)
+# ════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    main()
