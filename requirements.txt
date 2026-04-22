@@ -4,3 +4,4 @@ pingouin
 numpy
 matplotlib
 seaborn
+reportlab
