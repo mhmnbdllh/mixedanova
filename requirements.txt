@@ -1,7 +1,6 @@
 streamlit
-pandas
-pingouin
+scipy
 numpy
+pandas
 matplotlib
-seaborn
 reportlab
